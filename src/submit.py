@@ -1,6 +1,7 @@
 import socket
 from subprocess import Popen, PIPE
 import click
+import os
 
 # developed and tested
 def execute_command(cmd, shell=False, vars={}):
@@ -25,14 +26,17 @@ def submit(task):
     user = execute_command("whoami").strip()
     current_directory = execute_command("pwd").strip()
 
-    task = user + "+" +current_directory + "+/" + task
+    # making the path absolute, so it can be used easily by the resource manager later
+    task = os.path.abspath(task)
+
+    # giving user, current directory, and task's absolute path to the resource manager
+    task = user + "+" +current_directory + "+" + task
 
     client_socket.send(task.encode())  # send message
     
     data = client_socket.recv(1024).decode()  # receive response
     print(data)  # show in terminal
     client_socket.close()  # close the connection
-
 
 
 if __name__ == '__main__':

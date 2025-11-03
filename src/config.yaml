@@ -1,0 +1,42 @@
+# version your configs so you can evolve the schema safely
+version: 1
+
+# monitoring patience
+monitor:
+  window: 30
+
+# mapping configuration
+mapper:
+  # one of:     
+  # exclusive, round-robin
+  # oracle-FF, oracle-MAGM, oracle-BF, oracle-least_GPU_utiltized
+  # most-GMem-available-RR, least_GPU_utilized-RR, 
+  # estimate-most-GMem-available (estimators needs to be set for the experiment first)
+  policy: exclusive
+  #policy: exclusive
+  #policy: oracle-RR
+  #policy: oracle-FF
+  #policy: oracle-BF
+  #policy: oracle-MAGM    
+  #policy: oracle-LUG
+  #policy: OR-RR
+  #policy: OR-MAGM
+  #policy: OR-LUG
+  #policy: EST-MAGM
+  #policy: EST-LUG
+  # knobs for each policy (ignored when not applicable)
+  estimator: None
+  # estimator: None
+  # estimator: horus
+  # estimator: faketensor
+  # estimator: GPUMemNet
+
+recovery:
+  dir: "/home/ehyo/rad-scheduler/01-Exclusive-replication"
+  # dir: "/home/ehyo/rad-scheduler/04-Oracle-BF"
+  # dir: "/home/ehyo/rad-scheduler/03-Oracle-FF"
+  # dir: "/home/ehyo/rad-scheduler/06-Oracle-LUG"
+  #dir: "/home/ehyo/rad-scheduler/07-OR-RR"
+  #dir: "/home/ehyo/rad-scheduler/08-OR-MAGM"
+  #dir: "/home/ehyo/rad-scheduler/09-OR-LUG"
+  #dir: /home/ehyo/rad-scheduler/Exclusive

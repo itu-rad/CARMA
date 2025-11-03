@@ -2,11 +2,11 @@ import datetime
 import uuid
 
 class Task:
-    def __init__(self, user, dir, file):
+    def __init__(self, user, dir, task):
         self.task_id = uuid.uuid4()
         self.user = user
         self.dir = dir
-        self.file = file
+        self.task = task
         # when it is queued is considered as 
         self.user_submit_time = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
         self.start_service_time = None
@@ -16,7 +16,7 @@ class Task:
         self.recovered = False
 
     def _to_string(self):
-        return f"task id: {self.task_id} \nsubmitted by user: {self.user}, \ndirectory: {self.dir} \nfile: {self.file} \nrecovered?: {self.recovered}"
+        return f"task id: {self.task_id} \nsubmitted by user: {self.user}, \ndirectory: {self.dir} \ntask: {self.task} \nrecovered?: {self.recovered}"
 
     def set_id(self, id):
         self.task_id = id

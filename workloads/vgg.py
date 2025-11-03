@@ -91,13 +91,7 @@ def fn(model, batch_size, d):
             print(f"GB after forward: {ftmp.max_memory / GB}")
             output.sum().backward()
             print(f"GB after backward: {ftmp.max_memory / GB}")
-            return ftmp.max_memory 
-# added by ehsan
-var = ()
-# added by Ehsan for time control
-start_time =0
-max_duration = 3 * 60
-# ===============================
+            return ftmp.max_memory
 
 
 
@@ -131,8 +125,15 @@ def train_vgg(batch_size, num_epochs=10, learning_rate=0.001, data_dir='/raid/da
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
 
-    print(fn(model, batch_size, (3, 224, 224)))
     
+    faketensor_time1 = time.perf_counter()
+    print(fn(model, batch_size, (3, 224, 224)))
+    faketensor_time2 = time.perf_counter()
+
+    faketensor_time = faketensor_time2 - faketensor_time1
+    print("Time taken by faketensor: ", faketensor_time)
+
+
     # Save model summary to a file
     summary_path = f'vgg_{batch_size}.model'
     with open(summary_path, 'w') as f:
@@ -194,7 +195,7 @@ def train_vgg(batch_size, num_epochs=10, learning_rate=0.001, data_dir='/raid/da
 
 if __name__ == "__main__":
 
-    start = time.time()
+    start = time.perf_counter()
 
     parser = argparse.ArgumentParser(description='Train VGG on ImageNet.')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training.')
@@ -207,7 +208,7 @@ if __name__ == "__main__":
 
     train_vgg(batch_size=args.batch_size, num_epochs=args.num_epochs, learning_rate=args.learning_rate, data_dir=args.data_dir, meta_cache_dir=args.meta_cache_dir)
 
-    end = time.time()
+    end = time.perf_counter()
 
     execution_time = end - start
 

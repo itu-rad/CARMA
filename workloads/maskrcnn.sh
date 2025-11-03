@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=1 python /home/ehyo/rad-scheduler/workloads/vision/references/detection/train.py --dataset coco --data-path /raid/datasets/coco --model maskrcnn_resnet50_fpn --epochs 1 -b 8 --output-dir runs

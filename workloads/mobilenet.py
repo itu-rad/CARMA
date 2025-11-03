@@ -123,8 +123,15 @@ def train_mobilenet(batch_size, num_epochs=10, learning_rate=0.001, data_dir='/r
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
 
-    print(fn(model, batch_size, (3, 224, 224)))
     
+    faketensor_time1 = time.perf_counter()
+    print(fn(model, batch_size, (3, 224, 224)))
+    faketensor_time2 = time.perf_counter()
+
+    faketensor_time = faketensor_time2 - faketensor_time1
+    print("Time taken by faketensor: ", faketensor_time)
+
+
     # Capture and save model summary
     summary_path = f'mobilenet_{batch_size}.model'
     with open(summary_path, 'w') as f:
@@ -179,7 +186,7 @@ def train_mobilenet(batch_size, num_epochs=10, learning_rate=0.001, data_dir='/r
 # Argument parsing
 if __name__ == "__main__":
 
-    start = time.time()
+    start = time.perf_counter()
 
     parser = argparse.ArgumentParser(description='Train MobileNetV2 on ImageNet.')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training.')
@@ -190,7 +197,7 @@ if __name__ == "__main__":
 
     train_mobilenet(batch_size=args.batch_size, num_epochs=args.num_epochs, learning_rate=args.learning_rate, data_dir=args.data_dir)
 
-    end = time.time()
+    end = time.perf_counter()
 
     execution_time = end - start
 

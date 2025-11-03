@@ -1,0 +1,12 @@
+# assumption is that model.txt file is in this directory
+conda activate tf
+python /home/ehyo/rad-scheduler/workloads/UNet.py
+UNet.model
+/raid/datasets/VOCO
+32
+exclusive
+1
+9910
+2231.06
+3404.085
+8000

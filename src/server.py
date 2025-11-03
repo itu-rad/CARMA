@@ -6,16 +6,177 @@ import subprocess
 import os
 import logging
 
+from typing import Set
+
+
+
 import monitor
 import rad_parser
 from task_queue import Task, Tasks
 from itertools import cycle, islice
+from load_yaml import load_yaml
+
+# for getting the launched task PID
+def launch_and_get_pid(cmd: str) -> int | None:
+    p = subprocess.Popen(
+        ["bash", "-lc", cmd],
+        stdout=subprocess.PIPE,      # receives the echoed PID
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+        preexec_fn=os.setsid,   # <<< unique SID per launch
+    )
+    pid_line = p.stdout.readline().strip() if p.stdout else ""
+    if p.stdout:
+        p.stdout.close()            # don't wait; job keeps running
+    try:
+        return int(pid_line)
+    except ValueError:
+        return None
+# ending the logic for getting PID
+
+# --- add helpers (just above descendants) ---
+def _proc_children_once(pid: int) -> list[int]:
+    PROC_CHILDREN_HELPER = "/usr/bin/proc_children_helper"
+    """Direct children via /proc (more reliable than pgrep)."""
+    try:
+        out = subprocess.check_output([PROC_CHILDREN_HELPER, str(pid)], text=True)
+        # print("children for the pid ", pid, ": ", [int(x) for x in out.split() if x.isdigit()])
+        return [int(x) for x in out.split() if x.isdigit()]
+
+    except Exception:
+        print("could not read children")
+        return []
+
+def _session_id(pid: int) -> str | None:
+    """Return POSIX session id (SID) of a pid, or None."""
+    try:
+        out = subprocess.check_output(["ps", "-o", "sid=", "-p", str(pid)], text=True).strip()
+
+        # print("found the session id for pid ", pid, " is: ", out)
+        return out if out else None
+    except subprocess.CalledProcessError:
+        return None
+
+def _pids_in_same_session(launcher_pid: int) -> Set[int]:
+    """All PIDs that share the same SID as launcher (helps with MPS, fork/exec)."""
+    sid = _session_id(launcher_pid)
+    if not sid:
+        return set()
+    try:
+        # List all pids with their sid, filter by sid
+        out = subprocess.check_output(["ps", "-e", "-o", "pid=,sid="], text=True)
+    except subprocess.CalledProcessError:
+        return set()
+    s = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == sid and parts[0].isdigit():
+            s.add(int(parts[0]))
+    
+    # print("pids in the same session got and aggregated: ", s)
+    return s
+
+# --- replace descendants() with a proc-based, recursive walk + SID union ---
+def descendants(pid: int) -> set[int]:
+    """All descendants of pid (via /proc), plus same-session PIDs for MPS cases."""
+    seen: Set[int] = set()
+    frontier = [pid]
+    while frontier:
+        p = frontier.pop()
+        if p in seen:
+            continue
+        seen.add(p)
+        # use /proc children (robust across shells/conda)
+        kids = _proc_children_once(p)
+        frontier.extend(kids)
+    # union same-session peers (captures MPS client that exec'd out of the tree)
+    return seen | _pids_in_same_session(pid)
+
+
+# --- pid resolve logic: also accept same-session matches ---
+def resolve_gpu_pid(launcher_pid: int, timeout=30, poll=0.5) -> int:
+    # deadline for checking for the appearance
+    deadline = time.time() + timeout
+    sid_l = _session_id(launcher_pid)  # compute once
+    last_seen = None
+
+    while time.time() < deadline:
+        # if the launcher died, fall back
+        if not monitor.pid_on_system(str(launcher_pid)):
+            return last_seen or launcher_pid
+        
+        # children can change over time — refresh every iteration
+        cand = descendants(launcher_pid)
+        if sid_l:
+            cand |= _pids_in_same_session(launcher_pid)  # belt & suspenders
+
+        found = None
+        # getting processes on all GPUs
+        for row in monitor.pmon_rows():
+
+            cmd = row.get("cmd", "")
+
+            # ignoring the row when it has mps daemon
+            if cmd in {"nvidia-cuda-mps", "nvidia-cuda-mps-control"}:
+                continue
+            
+            pid_s = row.get("pid", "")
+            if pid_s.isdigit():
+                gpu_pid = int(pid_s)
+                if gpu_pid in cand:
+                    found = gpu_pid
+                    break
+
+        if found is not None:
+            # (optional) return only if seen twice in a row to avoid transient matches
+            if last_seen == found:
+                return found
+            last_seen = found
+                
+        time.sleep(poll)
+
+    
+    return last_seen or launcher_pid
+
+
+def _async_resolve_and_update(launcher_pid: int, gpu_uuids: list[str]) -> None:
+    try:
+        real_pid = resolve_gpu_pid(launcher_pid, timeout=1000, poll=0.5)
+        print("resolved the PID, and will update the table")
+        for u in gpu_uuids:
+            gpus_state.at[u, "CPU_task_PID"] = int(real_pid)
+            # kick off the grace window immediately if PMON already sees it
+            print("updated the validity table!", gpus_state)
+
+            # updating the table if even we see it here, however, update will take care of it :)
+            if monitor.is_in_pmon(str(real_pid)):
+                print("oh! wait, I saw it here right after resolving!")
+                mark_seen_now(u)
+
+    except Exception as e:
+        logging.exception("async resolve failed for %s: %s", launcher_pid, e)
 
 
 # logger for keeping track of submission, dispatch, and termination time
 logging.basicConfig(filename='std.log', filemode='w', format='%(asctime)s %(message)s', datefmt='%d-%b-%y %H:%M:%S')
 logger=logging.getLogger() 
 logger.setLevel(logging.DEBUG) 
+
+# loading mapping policy
+cfg = load_yaml()
+
+policy = cfg.get("mapper", {}).get("policy", "exclusive")
+print("Configured mapping policy:", policy)
+# end of reading the mapper's policy
+
+estimator = cfg.get("mapper", {}).get("estimator", "None")
+print("Configured mapping estimator:", estimator)
+# end of reading the GPU memory estimator
+
+recovery_dir = cfg.get("recovery", {}).get("dir", "/home/ehyo/rad-scheduler")
+print("Configured recovery directory:", recovery_dir)
+# end of reading the recovery mechanism to look directory
 
 # locks for avoiding race condition
 lock = Lock()
@@ -26,6 +187,8 @@ main_queue = Tasks()
 recovery_queue = Tasks()
 
 
+
+# ============= for having Round-Robin selection logic of GPUs ============
 gpu_UUIDs = monitor.gpu_uuids()
 
 GPU_IDs = []
@@ -44,14 +207,154 @@ def select_ids(n):
         list: List of selected IDs.
     """
     return list(islice(round_robin_generator, n))
-# =============================================
+# ============= End of Round Robin selection logic of GPUs =================
 
-
+# keeps track of the handles crashes
+# The inital logic is to recover a (OOM) crashed task once
+# since the next step is handling it with relaunching
+# with an exclusive access to a GPU/ GPUs
 handled_crashes = []
 
-def recovery(dirs = ['/home/ehyo/CARMA/src']):
-    print("recovery process started ...")
-    time.sleep(5)
+
+# data strcture to keep track of
+# what tasks are assigned to which tasks
+# if they are moved from CPU --> GPU
+
+patience = cfg.get("monitor", {}).get("patience", "10")
+monitoring_window_size = cfg.get("monitor", {}).get("window", "30")
+
+# finished reading the monitoring patience
+
+import pandas as pd
+gpus_state = pd.DataFrame(
+    {
+        "CPU_task_PID": pd.Series(dtype="str"),   # last PID sent to this GPU (nullable int)
+        "validity":     pd.Series(dtype="boolean"), # ready for next decision
+        "gpu_seen_at":  pd.Series(dtype="float64"), # time.monotonic() when first seen on GPU
+    },
+)
+
+# defining the state of the GPU when a task gets launched for it
+def init_gpu_state(uuid_to_id: dict[str, str]) -> pd.DataFrame:
+    idx = pd.Index(list(uuid_to_id.keys()), name="GPU_uuid", dtype="string")
+    df = pd.DataFrame(index=idx)
+    # mapping column (index-aware)
+    df["GPU_id"]       = pd.Series([str(uuid_to_id[u]) for u in idx], index=idx, dtype="string")
+    # state columns (index-aware, with desired dtypes)
+    df["CPU_task_PID"] = pd.Series(pd.NA,   index=idx, dtype="Int64")
+    df["validity"]     = pd.Series(True,   index=idx, dtype="boolean")
+    df["gpu_seen_at"]  = pd.Series(pd.NA,   index=idx, dtype="Float64")
+    return df
+
+#  ====== initialized GPUs ======
+gpus_state = init_gpu_state(gpu_UUIDs)
+
+
+def launch_task(gpu_uuid: str, pid: int) -> None:
+    # assumes fixed set of GPUs initialized; raise if unknown
+    if gpu_uuid not in gpus_state.index:
+        raise KeyError(f"Unknown GPU UUID: {gpu_uuid}")
+    gpus_state.at[gpu_uuid, "CPU_task_PID"] = int(pid)
+    gpus_state.at[gpu_uuid, "validity"] = False
+    gpus_state.at[gpu_uuid, "gpu_seen_at"] = pd.NA
+
+
+def mark_seen_now(gpu_uuid: str, now: float | None = None) -> None:
+    now = time.monotonic() if now is None else now
+    if pd.isna(gpus_state.at[gpu_uuid, "gpu_seen_at"]):
+        gpus_state.at[gpu_uuid, "gpu_seen_at"] = float(now)
+
+
+def update():
+    now = time.monotonic()
+    for gpu_uuid in gpus_state.index:
+        # print(gpu_uuid, str(gpus_state.loc[gpu_uuid, "CPU_task_PID"]))
+        # print(time.monotonic() - gpus_state.loc[gpu_uuid, "gpu_seen_at"], gpus_state.loc[gpu_uuid, "validity"])
+        # print(gpu_uuid)
+        # print(monitor.is_in_pmon(str(gpus_state.loc[gpu_uuid, "CPU_task_PID"])))
+
+        pid_val = gpus_state.loc[gpu_uuid, "CPU_task_PID"]
+
+        # Hard lesson: if the task crashes, we need to validate the GPU and bring it back
+        if pd.isna(pid_val):
+            gpus_state.loc[gpu_uuid, "validity"] = True
+            gpus_state.at[gpu_uuid, "CPU_task_PID"] = pd.NA
+            gpus_state.at[gpu_uuid, "gpu_seen_at"] = pd.NA
+            continue
+        
+        pid = str(pid_val)
+
+        # if process died, free the slot
+        if not monitor.pid_on_system(pid):
+            gpus_state.loc[gpu_uuid, "validity"] = True
+            gpus_state.loc[gpu_uuid, "gpu_seen_at"] = pd.NA
+            gpus_state.loc[gpu_uuid, "CPU_task_PID"] = pd.NA
+            continue
+        
+        seen_at = gpus_state.at[gpu_uuid, "gpu_seen_at"]
+
+        # set the first-seen timestamp once
+        if pd.isna(seen_at) and monitor.is_in_pmon(pid):
+            gpus_state.at[gpu_uuid, "gpu_seen_at"] = now
+            seen_at = now
+
+        # after grace, mark available (don’t require PMON to still show the PID)
+        if not pd.isna(seen_at) and (now - float(seen_at) > 30):
+            gpus_state.at[gpu_uuid, "validity"] = True
+            gpus_state.at[gpu_uuid, "CPU_task_PID"] = pd.NA
+            gpus_state.at[gpu_uuid, "gpu_seen_at"] = pd.NA
+
+
+def all_available_GPUs():
+    return gpus_state.index[gpus_state["validity"].fillna(False)].tolist()
+
+
+# The process to keep track of available GPUs keeping track of process PIDs
+# 1. initializing GPUs state
+# print(gpu_UUIDs)
+
+# print(gpus_state)
+
+# 2. when adding a task to a GPU
+# launch_task(GPU_UUID, TASK_PID)
+
+# 3. having update in the loop to validate the GPUs for collocation
+# update()
+
+print("Initialized the gpus_state tracker: ", gpus_state)
+
+# to get the list of available GPUs for collocation, not for exclusive policy
+# for exclusive case, we need to get idle GPUs and make sure that non of them are in the CPU->GPU PID transfer
+# it is way more efficient than waiting to make sure that a task moves from CPU --> GPU
+# print(monitor.gpus_activeness())
+# print(all_available_GPUs())
+# exit()
+
+# command generator function
+def command_generator(dir, gpus_identifiers, command_to_execute, now, a):
+    command = f"""cd {dir} ; \
+                export CUDA_VISIBLE_DEVICES={gpus_identifiers} ; \
+                exec 3>&1 ; \
+                {{ time ( \
+                    {{ \
+                        conda run --no-capture-output -p /opt/miniconda3/envs/tf {command_to_execute} & pid=$! ; \
+                        echo $pid >&3 ; \
+                        wait $pid ; \
+                        if [ $? -eq 0 ]; then \
+                            echo 'Successful' >> {dir}/err-{now}-{a.task_id}.log ; \
+                        else \
+                            echo 'unsuccessful' >> {dir}/err-{now}-{a.task_id}.log ; \
+                        fi ; \
+                    }} 1> {dir}/out-{now}-{a.task_id}.log 2>> {dir}/err-{now}-{a.task_id}.log \
+                ) ; }} 2> {dir}/time-{now}-{a.task_id}.et ; \
+                exec 3>&-"""
+    return command
+
+
+# this function is responsible for implementing recovery method
+# taking care of the system's robustness
+def recovery(dirs = [globals()["recovery_dir"]]):
+    # print("recovery process started ...")
     """
         This is the function that checks error files and adds OOM found to the high-priority queue
     """
@@ -81,7 +384,7 @@ def recovery(dirs = ['/home/ehyo/CARMA/src']):
             Lines = file.readlines()                    # reading the lines of that file
 
             for line in Lines: # going through lines of an opened file to find if the execution crashed due to OOM
-                if "unsuccessful" in line:#"OOM" in line or "Non-OK-status" in line or "RESOURCE_EXHAUSTED" in line:
+                if "unsuccessful" in line or "OOM" in line or "Non-OK-status" in line or "RESOURCE_EXHAUSTED" in line:
                     crashes += 1
                     
                     handled_crashes.append(iterator)    # We add it to the handled one to prevent over-scheduling
@@ -104,15 +407,17 @@ def recovery(dirs = ['/home/ehyo/CARMA/src']):
                         recovery_queue.enqueue(recovered_task)                  # putting the task in the recovery queue
                     print("OOM FOUND: recovery queue is filled with the task that has problem: ", recovered_task, recovered_task._to_string())
                     print("length of the queue:", recovery_queue.length())
+                    logging.info(f"Recovered: {recovered_task}")
                     break
-    print("end of checking for failures ...")
+    # print("end of checking for failures ...")
 
 
+# for launching bash command from Python
 def command_executor(command):
     subprocess.run(command, shell=True, check=True, executable='/bin/bash')
     pass
 
-
+# the function getting tasks from submit interface and queuing them
 def server():
     host = socket.gethostname()
     port = 5001
@@ -136,22 +441,18 @@ def server():
             message = "Got your task and queued it."
 
             conn.send(message.encode())
+            # print(data)
             
-            print(data)
-            user, dir, file = data.split('+')
-            file = file[1:]
+            user, dir, task = data.split('+')
+            task = "/" + task[1:]
             
-            file = dir+"/"+file
+            print(user, dir, task)
 
-            # print(user, dir, file)
-            # it needs to be developed well :D
-
-            a = Task(user, dir, file)
+            a = Task(user, dir, task)
 
             with lock:
                 main_queue.enqueue(a)
-
-                logging.info(f"queued {a.task_id} - {a.file}")
+                logging.info(f"queued {a.task_id} - {a.task}")
 
         conn.close()
 
@@ -159,70 +460,97 @@ def server():
 
 # this is the module implementing different policies for 
 # assigning GPUs to tasks/ collocate tasks under different policies
-def scheduler(policy = "round-robin"):
+def scheduler(policy = policy):
     # exclusive, round-robin
     # oracle-first-fit, oracle-most-GMem-available, oracle-best-fit, oracle-least_GPU_utiltized
     # most-GMem-available-RR, least_GPU_utilized-RR, 
     # estimate-most-GMem-available (estimators needs to be set for the experiment first)
 
     # it needs to be a never-ending loops checking task queue, and GPUs, and making decisions
-    estimator = "None"
+    estimator = globals()["estimator"]
     # horus
-    # faketensor, GPUMemNet, oracle
+    # faketensor, GPUMemNet
 
+    # This is the index where the system considers the estimation to be found
     esIndex = 8
-
     if estimator == "None":
         print("No Estimator!")
     elif estimator == "horus":
-        print("horus :)")
+        print("horus, index = 9")
         esIndex = 9
     elif estimator == "faketensor":
-        print("faketensor :)")
+        print("faketensor, index = 10")
         esIndex = 10
     elif estimator == "GPUMemNet":
-        print("GPUMemNet :)")
+        print("GPUMemNet, index = 11")
         esIndex = 11
-    else:
-        print("oracle :)")
 
     while True:
+        time.sleep(1)
+
+        # Scanning for OOM crashes
+        # assumption: OOMs might happen because of the automatic collocation decisions
+        # GPU memory estimators are not perfect
+        # also GPU memory fragmentation can happen
+
         recovery()
 
+        update()
+
+        print("updated the table: ", gpus_state)
+
+        print(command_executor("nvidia-smi pmon -c 1"))
+        # print(gpus_state)
         # if there are some tasks waiting to be recovered/ served
         if main_queue.length() != 0 or recovery_queue.length() != 0:
             
+            # 1. initial approach was to wait till the warmup was up
+            # and the task has allocated its GPU memory requirement
+            # but it could be unrepresentatively short or long for different tasks
+
             # here is the code body that implements exclusive policy
             # waiting as some tasks take time to start using GPU
-            time.sleep(30)
+            # time.sleep(60)
+
+
+            # We improve the blindfolded waiting by tracking task PID
+            # 2. we follow PIDs and consider monitoring data valid for next steps
+            # when the process is moved from CPU to GPU
 
             idle_gpus_to_send_job = list()
             gpus_activeness = monitor.gpus_activeness()
             for gpu in gpus_activeness:
                 if gpus_activeness[gpu] == 0:
                     idle_gpus_to_send_job.append(gpu)
-                    
+            
             print("idle gpus: ", idle_gpus_to_send_job)
+            print("available GPUs:", all_available_GPUs())
+
+            # the logic that makes sure that we do not send task
+            # to a GPU that is not available since it is waiting 
+            # for its process to transfer from CPU to GPU
+            idle_and_available = [g for g in idle_gpus_to_send_job if g in set(all_available_GPUs())]
             
             # checking the job at the head of the recovery/ queue
             a = None
             main_queue_flag = None
-            user, dir, file = None, None, None
+            user, dir, task = None, None, None
 
             # Having higher priority for the tasks that need to be recovered
             if recovery_queue.length() != 0:
                 with recover_lock:
                     a = recovery_queue.check()
-                user, dir, file = a.user, a.dir, a.file
+                user, dir, task = a.user, a.dir, a.task
                 main_queue_flag = False
             else:
                 with lock:
                     a = main_queue.check()
-                user, dir, file = a.user, a.dir, a.file
+                user, dir, task = a.user, a.dir, a.task
                 main_queue_flag = True
 
-
-            command = f"cd {dir} ; cat {file}"
+            # for reading the task specification
+            command = f"cat {task}"
+            print("this is what we want to parse and work on: ", task, command)
             ret = subprocess.run(command, capture_output=True, shell=True)
             commands = ret.stdout.decode()
             commands_to_execute = commands.split("\n")
@@ -238,9 +566,10 @@ def scheduler(policy = "round-robin"):
                     env_name = "tf"
 
             # enabling the conda environment
-            environment = f"/home/{user}/.conda/envs/{env_name}"
+            environment = f"/opt/miniconda3/envs/{env_name}"
             print("conda environment to activate: ", env_name, environment)
 
+            #Exclusive policy to check with 
             # finding the python code to execute 
             command_to_execute = None
             for command in commands_to_execute:
@@ -248,19 +577,16 @@ def scheduler(policy = "round-robin"):
                     command_to_execute = command
                     break
             if command_to_execute == None:
-                print("the command could not be found in the submitted job profile!", file)
+                print("the command could not be found in the submitted job profile!", task)
 
             number_of_GPUs_requested = int(commands_to_execute[7])
 
-            print("command to execute: ", command_to_execute)
-            print("number of gpus requested: ", number_of_GPUs_requested)
-
             now = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
 
-            if len(idle_gpus_to_send_job) >= number_of_GPUs_requested:
-                assigned_gpus = idle_gpus_to_send_job[:number_of_GPUs_requested]
+            # we select idle GPUs that are also available
+            if len(idle_and_available) >= number_of_GPUs_requested:
+                assigned_gpus = idle_and_available[:number_of_GPUs_requested]
 
-                print("assigned GPUs: ", assigned_gpus)
                 a.set_service_time(now)
                 a.set_status("dispatched")
                 
@@ -271,58 +597,64 @@ def scheduler(policy = "round-robin"):
                     else:
                         gpus_identifiers += f"{gpu}"
 
-                logging.info(f"dispatched {a.task_id} - {a.file} - {gpus_identifiers}")
-
-                print("assigned gpus with identifiers: ", gpus_identifiers)
-
-                command = f"""cd {dir} ; . /opt/anaconda/etc/profile.d/conda.sh ; conda activate {environment} ; export CUDA_VISIBLE_DEVICES={gpus_identifiers} ; {{ time {command_to_execute} 1> out-{now}-{a.task_id}.log 2>> err-{now}-{a.task_id}.log ; }} 2> time-{now}-{a.task_id}.et & pid=$!
-                    wait $pid
-                    if [ $? -eq 0 ]; then
-                        echo 'Successful' >> err-{now}-{a.task_id}.log
-                    else
-                        echo 'unsuccessful' >>  err-{now}-{a.task_id}.log
-                    fi"""
-
+                command = command_generator(dir, gpus_identifiers, command_to_execute, now, a)                
+                
                 # discarding the task, as it has got the resources and got submitted for the execution
                 if main_queue_flag == True:
                     main_queue.dequeue()
                 else:
                     recovery_queue.dequeue()
 
-                to_write = f'echo "{dir}+{environment}+{command_to_execute}+{file}+{user}+{a.task_id}" > err-{now}-{a.task_id}.log'
+                to_write = f'echo "{dir}+{environment}+{command_to_execute}+{task}+{user}+{a.task_id}" > {dir}/err-{now}-{a.task_id}.log'
+
+                # logging the GPU to task mapping
+                logging.info(f"dispatched {a.task_id} - {a.task} - {gpus_identifiers}")
 
                 Thread(target = command_executor, args=(to_write,)).start()
-                Thread(target = command_executor, args=(command,)).start()
+                pid = launch_and_get_pid(command)
 
+                if pid is None:
+                    logging.error(f"Failed to capture PID for {a.task_id}; leaving GPUs available")
+                else:
+                    # now the task is mapped to a GPU, so it availability needs to be updated
+                    # Immediately mark these GPUs unavailable using the launcher PID
+                    for gpu_uuid in assigned_gpus:
+                        launch_task(gpu_uuid, pid)
+
+
+                    # Resolve real GPU-using PID in the background and update state when found
+                    Thread(
+                        target=_async_resolve_and_update,
+                        args=(pid, list(assigned_gpus)),
+                        daemon=True
+                    ).start()
+                
+                print(gpus_state)
                 continue
 
             # ========================================================================================
             # ================================= ORACLE - FIRST FIT ===================================
             # ========================================================================================
-            # elif policy == "oracle-first-fit" and recovery_queue.length() == 0:
-            elif policy == "oracle-first-fit":
-                print("First-Fit collocation")
-
-                print("waiting for 60 seconds so the behavior of tasks can stabilize ...")
-                time.sleep(30)
+            elif policy == "oracle-FF" and main_queue.length() != 0 and recovery_queue.length() == 0:
 
                 a = None
-                user, dir, file = None, None, None
+                user, dir, task = None, None, None
                 main_queue_flag = None
+
                 # Having higher priority for the tasks that need to be recovered
                 if recovery_queue.length() != 0:
                     with recover_lock:
                         a = recovery_queue.check()
-                    user, dir, file = a.user, a.dir, a.file
+                    user, dir, task = a.user, a.dir, a.task
                     main_queue_flag = False
                 else:
                     with lock:
                         a = main_queue.check()
-                    user, dir, file = a.user, a.dir, a.file
+                    user, dir, task = a.user, a.dir, a.task
                     main_queue_flag = True
 
 
-                command = f"cd {dir} ; cat {file}"
+                command = f"cat {task}"
                 ret = subprocess.run(command, capture_output=True, shell=True)
                 commands = ret.stdout.decode()
                 commands_to_execute = commands.split("\n")
@@ -337,7 +669,7 @@ def scheduler(policy = "round-robin"):
                         env_name = "tf"
 
                 # enabling the conda environment
-                environment = f"/home/{user}/.conda/envs/{env_name}"
+                environment = f"/opt/miniconda3/envs/{env_name}"
                 print("environment: ", env_name, environment)
 
                 # finding the python code to execute 
@@ -347,36 +679,48 @@ def scheduler(policy = "round-robin"):
                         command_to_execute = command
                         break
                 if command_to_execute == None:
-                    print("the command could not be found in the submitted job profile!")
+                    print("the command could not be found in the submitted job profile!", task)
 
                 print("command to execute found: ", command_to_execute)
 
                 # gpu memory requirement
                 gpu_memory_requirement = int(commands_to_execute[8])
-
                 print("memory requirement: ", gpu_memory_requirement)
+
                 # getting the monitored data about the server's GPUs
-                gpus_with_metrics = monitor.Gmetrics
-                
+                gpus_with_metrics = monitor.analyze_Gmetrics()
 
-                # making sure that none of them are executing the multi-GPU tasks
-                # the multi-gpu tasks are: xlnet, gpt2
-                # we should take them out of the gpus that are gonna be candidate :)
-                # multi_gpu_tasks_involved_gpus = process_detector.find_python_scripts()
+                # --- thresholds ---
 
-                # if len(multi_gpu_tasks_involved_gpus) > 0:
-                #     for gpu_uuids_to_remove in multi_gpu_tasks_involved_gpus:
-                #         gpus_with_metrics = gpus_with_metrics.drop(index=gpu_uuids_to_remove, errors='ignore')
-
+                THR_SMACT = 0.80   # SMs quite busy
+                THR_SMOCC = 0.45   # many resident warps
+                THR_DRAMA = 0.40   # memory interface busy
 
                 # Finding the GPUs that the task can get
                 # ===============
-                # condition 1 for filtering the GPUs based on the GPU memory requirement
+                # condition 1 for filtering the GPUs based on the GPU memory requirement & utils
                 # ===============
-                temp_ = gpus_with_metrics.loc[(gpus_with_metrics['GPU_mem_available']) >= (gpu_memory_requirement + 2000)]
-                candidate_gpus = temp_.loc[gpus_with_metrics['smact'] <= 0.8]
+                
+                # --- filtering: memory + utilization gate (same logic as MAGM) ---
+                temp_ = gpus_with_metrics.loc[
+                    gpus_with_metrics['GPU_mem_available'] >= (gpu_memory_requirement + 2048)
+                ]
+                
+                candidate_gpus = temp_.loc[
+                    ~(
+                        (temp_['smact'] >= THR_SMACT)
+                        & (
+                            (temp_['smocc'] >= THR_SMOCC)
+                            | (temp_['drama'] >= THR_DRAMA)
+                        )
+                    )
+                ].copy()
 
-                print("candidate GPUs:\n", candidate_gpus)
+                # only GPUs currently "available" by your adaptive state machine
+                avail = set(all_available_GPUs())
+                candidate_gpus = candidate_gpus.loc[candidate_gpus.index.isin(avail)].copy()
+
+                print("candidate & available GPUs:\n", candidate_gpus)
 
                 if candidate_gpus.empty:
                     print("no candidate gpus at all!")
@@ -396,6 +740,8 @@ def scheduler(policy = "round-robin"):
 
                 
                 now = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+
+                # FIRST-FIT: just take the first N rows as they appear (no sorting)
                 assigned_gpus = candidate_gpus.head(number_of_GPUs_requested)
 
                 print("assigned GPUs: ", assigned_gpus)
@@ -410,22 +756,11 @@ def scheduler(policy = "round-robin"):
                     else:
                         gpus_identifiers += f"{gpu}"
 
-                # /////////////////////////////////////////////////////////////////////////////////
-                # /////////////////////////////////////////////////////////////////////////////////
-
-                # writing logs to the system log
-                logging.info(f"dispatched {a.task_id} - {gpus_identifiers}")
 
                 # generating the command that will execute
-                command = f"""cd {dir} ; . /opt/anaconda/etc/profile.d/conda.sh ; conda activate {environment} ; export CUDA_VISIBLE_DEVICES={gpus_identifiers} ; {{ time {command_to_execute} 1> out-{now}-{a.task_id}.log 2>> err-{now}-{a.task_id}.log ; }} 2> time-{now}-{a.task_id}.et & pid=$!
-                    wait $pid
-                    if [ $? -eq 0 ]; then
-                        echo 'Successful' >> err-{now}-{a.task_id}.log
-                    else
-                        echo 'unsuccessful' >>  err-{now}-{a.task_id}.log
-                    fi"""
+                command = command_generator(dir, gpus_identifiers, command_to_execute, now, a)
                 
-                to_write = f'echo "{dir}+{environment}+{command_to_execute}+{file}+{user}+{a.task_id}" > err-{now}-{a.task_id}.log'
+                to_write = f'echo "{dir}+{environment}+{command_to_execute}+{task}+{user}+{a.task_id}" > {dir}/err-{now}-{a.task_id}.log'
                 
                 # now as we are here, shows that we have passed the conditions of having both 
                 # enough number of GPUs, and enought GPU memory
@@ -436,40 +771,56 @@ def scheduler(policy = "round-robin"):
                     with recover_lock:
                         recovery_queue.dequeue()
                 
+
+                logging.info(f"dispatched {a.task_id} - {gpus_identifiers}")
+
                 Thread(target = command_executor, args=(to_write,)).start()
-                Thread(target = command_executor, args=(command,)).start()
+                pid = launch_and_get_pid(command)
                 
+                if pid is None:
+                    logging.error(f"Failed to capture PID for {a.task_id}; leaving GPUs available")
+                else:
+                    # Immediately mark these GPUs unavailable using the launcher PID
+                    for gpu_uuid in assigned_gpus.index:
+                        launch_task(gpu_uuid, pid)
+
+                    # Resolve real GPU-using PID in the background and update state when found
+                    Thread(
+                        target=_async_resolve_and_update,
+                        args=(pid, list(assigned_gpus.index)),
+                        daemon=True
+                    ).start()
+                
+                # print(gpus_state)
+
+                # just a message
                 time_point = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-                print(time_point, "oracle first fit")
+                print(time_point, "Oracle-FF Collocated task on GPUs")
 
                 continue
 
             # ========================================================================================
             # ================================= ORACLE - BEST FIT ===================================
             # ========================================================================================
-            # elif policy == "oracle-best-fit" and recovery_queue.length() == 0:
-            elif policy == "oracle-best-fit":
-                print("Best-Fit collocation")
-
-                print("waiting for 30 seconds so the behavior of tasks can stabilize ...")
-                time.sleep(30)
-
+            elif (policy == "oracle-BF") and (main_queue.length() != 0) and (recovery_queue.length() == 0):
                 a = None
-                user, dir, file = None, None, None
+                user, dir, task = None, None, None
                 main_queue_flag = None
+
                 # Having higher priority for the tasks that need to be recovered
                 if recovery_queue.length() != 0:
                     with recover_lock:
                         a = recovery_queue.check()
-                    user, dir, file = a.user, a.dir, a.file
+                    user, dir, task = a.user, a.dir, a.task
                     main_queue_flag = False
                 else:
                     with lock:
                         a = main_queue.check()
-                    user, dir, file = a.user, a.dir, a.file
+                    user, dir, task = a.user, a.dir, a.task
                     main_queue_flag = True
-                        
-                command = f"cd {dir} ; cat {file}"
+
+
+                command = f"cat {task}"
                 ret = subprocess.run(command, capture_output=True, shell=True)
                 commands = ret.stdout.decode()
                 commands_to_execute = commands.split("\n")
@@ -484,7 +835,7 @@ def scheduler(policy = "round-robin"):
                         env_name = "tf"
 
                 # enabling the conda environment
-                environment = f"/home/{user}/.conda/envs/{env_name}"
+                environment = f"/opt/miniconda3/envs/{env_name}"
                 print("environment: ", env_name, environment)
 
                 # finding the python code to execute 
@@ -494,43 +845,69 @@ def scheduler(policy = "round-robin"):
                         command_to_execute = command
                         break
                 if command_to_execute == None:
-                    print("the command could not be found in the submitted job profile!")
+                    print("the command could not be found in the submitted job profile!", task)
 
                 print("command to execute found: ", command_to_execute)
 
-
+                # gpu memory requirement
                 gpu_memory_requirement = int(commands_to_execute[8])
+                print("memory requirement: ", gpu_memory_requirement)
 
-                # Finding the GPUs that the task can have :)
-                gpus_with_metrics = monitor.Gmetrics
+                # getting the monitored data about the server's GPUs
+                gpus_with_metrics = monitor.analyze_Gmetrics()
+
+                # --- thresholds ---
+
+                THR_SMACT = 0.80   # SMs quite busy
+                THR_SMOCC = 0.45   # many resident warps
+                THR_DRAMA = 0.40   # memory interface busy
+
+                # Finding the GPUs that the task can get
+                # ===============
+                # condition 1 for filtering the GPUs based on the GPU memory requirement & utils
+                # ===============
                 
-                # we can have these preconditions as well
-                temp_ = gpus_with_metrics.loc[(gpus_with_metrics['GPU_mem_available']) >= (gpu_memory_requirement + 500)]
-                candidate_gpus = temp_.loc[gpus_with_metrics['smact'] <= 0.8]
+                # --- filtering: memory + utilization gate (same logic as MAGM) ---
+                temp_ = gpus_with_metrics.loc[
+                    gpus_with_metrics['GPU_mem_available'] >= (gpu_memory_requirement + 2048)
+                ]
+                
+                candidate_gpus = temp_.loc[
+                    ~(
+                        (temp_['smact'] >= THR_SMACT)
+                        & (
+                            (temp_['smocc'] >= THR_SMOCC)
+                            | (temp_['drama'] >= THR_DRAMA)
+                        )
+                    )
+                ].copy()
 
-                print("candidate GPUs:\n", candidate_gpus)
+                # only GPUs currently "available" by your adaptive state machine
+                avail = set(all_available_GPUs())
+                candidate_gpus = candidate_gpus.loc[candidate_gpus.index.isin(avail)].copy()
+
+                print("candidate & available GPUs:\n", candidate_gpus)
 
                 if candidate_gpus.empty:
-                    print("No GPUs to submit job to!")
+                    print("no candidate gpus at all!")
+                    continue
+
+                # ===============
+                # condition 2: checking for the number of GPUs requested
+                # ===============
+                number_of_GPUs_requested = int(commands_to_execute[7])
+                print("number of gpus requested: ", number_of_GPUs_requested)
+
+                if len(candidate_gpus) < number_of_GPUs_requested:
+                    print("Not enough GPUs to submit the task to!")
                     continue
                 else:
-                    print("The gpus that we can send job to :) \n", candidate_gpus)
-                
-                # sorting to be the best fit 
+                    print("The gpus that we can send the task to: \n", candidate_gpus)
+
+                now = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+
+                # BEST-FIT: pick the *smallest* sufficient GPUs
                 sorted = candidate_gpus.sort_values(by="GPU_mem_available", ascending=True, kind="mergesort")
-
-                print("gpus sorted based on their available memory:\n", sorted)
-
-                number_of_GPUs_requested = int(commands_to_execute[7])
-
-                print("number of gpus requested: ", number_of_GPUs_requested)
-
-                if number_of_GPUs_requested > len(sorted):
-                    print("no available gpu, let's observe!")
-                    continue
-                
-                now = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-                    
                 assigned_gpus = sorted.head(number_of_GPUs_requested)
 
                 print("assigned GPUs: ", assigned_gpus)
@@ -545,19 +922,11 @@ def scheduler(policy = "round-robin"):
                     else:
                         gpus_identifiers += f"{gpu}"
 
-                # writing logs to the system log
-                logging.info(f"dispatched {a.task_id} - {gpus_identifiers}")
 
                 # generating the command that will execute
-                command = f"""cd {dir} ; . /opt/anaconda/etc/profile.d/conda.sh ; conda activate {environment} ; export CUDA_VISIBLE_DEVICES={gpus_identifiers} ; {{ time {command_to_execute} 1> out-{now}-{a.task_id}.log 2>> err-{now}-{a.task_id}.log ; }} 2> time-{now}-{a.task_id}.et & pid=$!
-                    wait $pid
-                    if [ $? -eq 0 ]; then
-                        echo 'Successful' >> err-{now}-{a.task_id}.log
-                    else
-                        echo 'unsuccessful' >>  err-{now}-{a.task_id}.log
-                    fi"""
+                command = command_generator(dir, gpus_identifiers, command_to_execute, now, a)
                 
-                to_write = f'echo "{dir}+{environment}+{command_to_execute}+{file}+{user}+{a.task_id}" > err-{now}-{a.task_id}.log'
+                to_write = f'echo "{dir}+{environment}+{command_to_execute}+{task}+{user}+{a.task_id}" > {dir}/err-{now}-{a.task_id}.log'
                 
                 # now as we are here, shows that we have passed the conditions of having both 
                 # enough number of GPUs, and enought GPU memory
@@ -568,207 +937,64 @@ def scheduler(policy = "round-robin"):
                     with recover_lock:
                         recovery_queue.dequeue()
                 
-                Thread(target = command_executor, args=(to_write,)).start()
-                Thread(target = command_executor, args=(command,)).start()
-                
-                time_point = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-                print(time_point, "oracle best fit!")
 
-                continue
-
-            # ========================================================================================
-            # =========================== MOST GPU MEMORY AVAILABLE =============================
-            # ========================================================================================
-            # === This policy collocates knowing the GMem, relying on the recovery method ===========
-            # =================== for OOMs due to memry fragmentation ==============================
-            # ========================================================================================
-            # elif policy == "oracle-most-GMem-available" :
-            elif policy == "oracle-most-GMem-available" and recovery_queue.length() == 0:
-                print("oracle most GMEM available")
-
-                print("waiting for 30 seconds so the behavior of tasks can stabilize ...")
-                time.sleep(30)
-
-                a = None
-                user, dir, file = None, None, None
-                main_queue_flag = None
-
-                # Having higher priority for the tasks that need to be recovered
-                if recovery_queue.length() != 0:
-                    with recover_lock:
-                        a = recovery_queue.check()
-                    user, dir, file = a.user, a.dir, a.file
-                    main_queue_flag = False
-                else:
-                    with lock:
-                        a = main_queue.check()
-                    user, dir, file = a.user, a.dir, a.file
-                    main_queue_flag = True
-
-                        
-                command = f"cd {dir} ; cat {file}"
-                ret = subprocess.run(command, capture_output=True, shell=True)
-                commands = ret.stdout.decode()
-                commands_to_execute = commands.split("\n")
-
-                # finding conda environment name
-                env_name = None
-                for command in commands_to_execute:
-                    if "activate" in command:
-                        env_name = commands_to_execute[1].split("activate")[1].strip()
-                        break
-                if env_name == None:
-                        env_name = "tf"
-
-                # enabling the conda environment
-                environment = f"/home/{user}/.conda/envs/{env_name}"
-                print("environment: ", env_name, environment)
-
-                # finding the python code to execute 
-                command_to_execute = None
-                for command in commands_to_execute:
-                    if "python" in command:
-                        command_to_execute = command
-                        break
-                if command_to_execute == None:
-                    print("the command could not be found in the submitted job profile!")
-
-                print("command to execute found: ", command_to_execute)
-
-                # gpu memory requirement
-                gpu_memory_requirement = int(commands_to_execute[8])
-
-                print("memory requirement: ", gpu_memory_requirement)
-                # getting the monitored data about the server's GPUs
-                gpus_with_metrics = monitor.Gmetrics
-                
-
-                # making sure that none of them are executing the multi-GPU tasks
-                # the multi-gpu tasks are: xlnet, gpt2
-                # we should take them out of the gpus that are gonna be candidate :)
-                # multi_gpu_tasks_involved_gpus = process_detector.find_python_scripts()
-
-                # if len(multi_gpu_tasks_involved_gpus) > 0:
-                #     for gpu_uuids_to_remove in multi_gpu_tasks_involved_gpus:
-                #         gpus_with_metrics = gpus_with_metrics.drop(index=gpu_uuids_to_remove, errors='ignore')
-
-
-                # Finding the GPUs that the task can get
-                # ===============
-                # condition 1 for filtering the GPUs based on the GPU memory requirement/ util
-                # ===============
-                temp_ = gpus_with_metrics.loc[gpus_with_metrics['GPU_mem_available'] >= (gpu_memory_requirement + 2000)]
-                candidate_gpus = temp_.loc[gpus_with_metrics['smact'] <= 0.8]
-
-                print("candidate GPUs:\n", candidate_gpus)
-
-                if candidate_gpus.empty:
-                    print("no candidate gpus at all!")
-                    continue
-                
-                # ===============
-                # condition 2: checking for the number of GPUs requested
-                # ===============
-                number_of_GPUs_requested = int(commands_to_execute[7])
-                print("number of gpus requested: ", number_of_GPUs_requested)
-
-                if len(candidate_gpus) < number_of_GPUs_requested:
-                    print("Not enough GPUs to submit the task to!")
-                    continue
-                else:
-                    print("The gpus that we can send the task to: \n", candidate_gpus)
-                
-                now = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-
-                # SORTING THE GPUS TO PRIORITIZE THE ONES WITH THE MOST GPU MEMORY
-                sorted = candidate_gpus.sort_values(by="GPU_mem_available", ascending=False, kind="mergesort")
-                assigned_gpus = sorted.head(number_of_GPUs_requested)
-
-                print("assigned GPUs: ", assigned_gpus)
-                a.set_service_time(now)
-                a.set_status("dispatched")
-                    
-                gpus_identifiers = ""
-                for gpu in assigned_gpus.index:
-                    if len(gpus_identifiers) > 0:
-                        gpus_identifiers += f",{gpu}"
-
-                    else:
-                        gpus_identifiers += f"{gpu}"
-
-                # /////////////////////////////////////////////////////////////////////////////////
-                # /////////////////////////////////////////////////////////////////////////////////
-
-                # writing logs to the system log
                 logging.info(f"dispatched {a.task_id} - {gpus_identifiers}")
 
-                # generating the command that will execute
-                command = f"""cd {dir} ; . /opt/anaconda/etc/profile.d/conda.sh ; conda activate {environment} ; export CUDA_VISIBLE_DEVICES={gpus_identifiers} ; {{ time {command_to_execute} 1> out-{now}-{a.task_id}.log 2>> err-{now}-{a.task_id}.log ; }} 2> time-{now}-{a.task_id}.et & pid=$!
-                    wait $pid
-                    if [ $? -eq 0 ]; then
-                        echo 'Successful' >> err-{now}-{a.task_id}.log
-                    else
-                        echo 'unsuccessful' >>  err-{now}-{a.task_id}.log
-                    fi"""
-                
-                to_write = f'echo "{dir}+{environment}+{command_to_execute}+{file}+{user}+{a.task_id}" > err-{now}-{a.task_id}.log'
-                
-                # now as we are here, shows that we have passed the conditions of having both 
-                # enough number of GPUs, and enought GPU memory
-
-                
-                if main_queue_flag == True:
-                    with lock:
-                        main_queue.dequeue()
-                else:
-                    with recover_lock:
-                        recovery_queue.dequeue()
-
                 Thread(target = command_executor, args=(to_write,)).start()
-                Thread(target = command_executor, args=(command,)).start()
+                pid = launch_and_get_pid(command)
                 
+                if pid is None:
+                    logging.error(f"Failed to capture PID for {a.task_id}; leaving GPUs available")
+                else:
+                    # Immediately mark these GPUs unavailable using the launcher PID
+                    for gpu_uuid in assigned_gpus.index:
+                        launch_task(gpu_uuid, pid)
+
+                    # Resolve real GPU-using PID in the background and update state when found
+                    Thread(
+                        target=_async_resolve_and_update,
+                        args=(pid, list(assigned_gpus.index)),
+                        daemon=True
+                    ).start()
+                
+                # print(gpus_state)
+
                 # just a message
                 time_point = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-                print(time_point, "ORACLE MOST GPU MEMORY AVAILABLE")
+                print(time_point, "Oracle-BF Collocated task on GPUs")
 
                 continue
 
-
-
-
-
-
-
-            # ==================================== Estimators ========================================
-            # =========================== MOST GPU MEMORY AVAILABLE =============================
             # ========================================================================================
-            # === This policy collocates based on the info it gets from the estimators ===========
+            # ==================================== ORACLE - MAGM =====================================
             # ========================================================================================
-            # elif policy == "estimate-most-GMem-available" and recovery_queue.length() == 0:
-            elif policy == "estimate-most-GMem-available" and recovery_queue.length() == 0:
-                print("most-gpu_memory_available")
-
-                print("waiting for 30 seconds so the behavior of tasks can stabilize ...")
-                time.sleep(30)
+            # === This policy collocates knowing the GMem, relying on the recovery method ============
+            # =================== for OOMs due to memry fragmentation ================================
+            # ========================================================================================
+            elif policy == "oracle-MAGM" and (main_queue.length() != 0 and recovery_queue.length() == 0):
 
                 a = None
-                user, dir, file = None, None, None
+                user, dir, task = None, None, None
                 main_queue_flag = None
 
                 # Having higher priority for the tasks that need to be recovered
                 if recovery_queue.length() != 0:
                     with recover_lock:
                         a = recovery_queue.check()
-                    user, dir, file = a.user, a.dir, a.file
+                    user, dir, task = a.user, a.dir, a.task
                     main_queue_flag = False
                 else:
                     with lock:
                         a = main_queue.check()
-                    user, dir, file = a.user, a.dir, a.file
+                    user, dir, task = a.user, a.dir, a.task
                     main_queue_flag = True
 
                         
-                command = f"cd {dir} ; cat {file}"
+                command = f"cat {task}"
+
+                # print(gpus_state)
+
+                print("this is what we want to parse and work on and collocate: ", task, command)
                 ret = subprocess.run(command, capture_output=True, shell=True)
                 commands = ret.stdout.decode()
                 commands_to_execute = commands.split("\n")
@@ -783,8 +1009,8 @@ def scheduler(policy = "round-robin"):
                         env_name = "tf"
 
                 # enabling the conda environment
-                environment = f"/home/{user}/.conda/envs/{env_name}"
-                print("environment: ", env_name, environment)
+                environment = f"/opt/miniconda3/envs/{env_name}"
+                print("conda environment to activate: ", env_name, environment)
 
                 # finding the python code to execute 
                 command_to_execute = None
@@ -793,344 +1019,51 @@ def scheduler(policy = "round-robin"):
                         command_to_execute = command
                         break
                 if command_to_execute == None:
-                    print("the command could not be found in the submitted job profile!")
+                    print("the command could not be found in the submitted job profile!", task)
 
-                print("command to execute found: ", command_to_execute)
-
-                # gpu memory requirement
-                gpu_memory_requirement = float(commands_to_execute[esIndex])
-
-                print("memory requirement: ", gpu_memory_requirement)
-                # getting the monitored data about the server's GPUs
-                gpus_with_metrics = monitor.Gmetrics
-                
-
-                # making sure that none of them are executing the multi-GPU tasks
-                # the multi-gpu tasks are: xlnet, gpt2
-                # we should take them out of the gpus that are gonna be candidate :)
-                # multi_gpu_tasks_involved_gpus = process_detector.find_python_scripts()
-
-                # if len(multi_gpu_tasks_involved_gpus) > 0:
-                #     for gpu_uuids_to_remove in multi_gpu_tasks_involved_gpus:
-                #         gpus_with_metrics = gpus_with_metrics.drop(index=gpu_uuids_to_remove, errors='ignore')
-
-
-                # Finding the GPUs that the task can get
-                # ===============
-                # condition 1 for filtering the GPUs based on the GPU memory requirement/ util
-                # ===============
-                temp_ = gpus_with_metrics.loc[(gpus_with_metrics['GPU_mem_available']) >= (gpu_memory_requirement)]
-                # candidate_gpus = temp_.loc[gpus_with_metrics['smact'] <= 0.8]
-
-                candidate_gpus = temp_
-
-                print("candidate GPUs:\n", candidate_gpus)
-
-                if candidate_gpus.empty:
-                    print("no candidate gpus at all!")
-                    continue
-                
-                # ===============
-                # condition 2: checking for the number of GPUs requested
-                # ===============
-                number_of_GPUs_requested = int(commands_to_execute[7])
-                print("number of gpus requested: ", number_of_GPUs_requested)
-
-                if len(candidate_gpus) < number_of_GPUs_requested:
-                    print("Not enough GPUs to submit the task to!")
-                    continue
-                else:
-                    print("The gpus that we can send the task to: \n", candidate_gpus)
-                
-                now = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-
-                # SORTING THE GPUS TO PRIORITIZE THE ONES WITH THE MOST GPU MEMORY
-                sorted = candidate_gpus.sort_values(by="GPU_mem_available", ascending=False, kind="mergesort")
-                assigned_gpus = sorted.head(number_of_GPUs_requested)
-
-                print("assigned GPUs: ", assigned_gpus)
-                a.set_service_time(now)
-                a.set_status("dispatched")
-                    
-                gpus_identifiers = ""
-                for gpu in assigned_gpus.index:
-                    if len(gpus_identifiers) > 0:
-                        gpus_identifiers += f",{gpu}"
-
-                    else:
-                        gpus_identifiers += f"{gpu}"
-
-                # /////////////////////////////////////////////////////////////////////////////////
-                # /////////////////////////////////////////////////////////////////////////////////
-
-                # writing logs to the system log
-                logging.info(f"dispatched {a.task_id} - {gpus_identifiers}")
-
-                # generating the command that will execute
-                command = f"""cd {dir} ; . /opt/anaconda/etc/profile.d/conda.sh ; conda activate {environment} ; export CUDA_VISIBLE_DEVICES={gpus_identifiers} ; {{ time {command_to_execute} 1> out-{now}-{a.task_id}.log 2>> err-{now}-{a.task_id}.log ; }} 2> time-{now}-{a.task_id}.et & pid=$!
-                    wait $pid
-                    if [ $? -eq 0 ]; then
-                        echo 'Successful' >> err-{now}-{a.task_id}.log
-                    else
-                        echo 'unsuccessful' >>  err-{now}-{a.task_id}.log
-                    fi"""
-                
-                to_write = f'echo "{dir}+{environment}+{command_to_execute}+{file}+{user}+{a.task_id}" > err-{now}-{a.task_id}.log'
-                
-                # now as we are here, shows that we have passed the conditions of having both 
-                # enough number of GPUs, and enought GPU memory
-
-                
-                if main_queue_flag == True:
-                    with lock:
-                        main_queue.dequeue()
-                else:
-                    with recover_lock:
-                        recovery_queue.dequeue()
-
-                Thread(target = command_executor, args=(to_write,)).start()
-                Thread(target = command_executor, args=(command,)).start()
-                
-                # just a message
-                time_point = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-                print(time_point, "ORACLE MOST GPU MEMORY AVAILABLE")
-
-                continue
-
-
-            
-            # =========================================================================
-            # ============== Collocation with knowing the memory requirement ==========
-            # ================== Least utilized GPUs are prioritized ==================
-            # =========================================================================
-
-            # elif policy == "oracle-least_GPU_utiltized" and recovery_queue.length() == 0:
-            elif policy == "oracle-least_GPU_utiltized" and recovery_queue.length() == 0:
-                print("oracle least utilized GPU")
-
-                print("waiting for 30 seconds so the behavior of tasks can stabilize ...")
-                time.sleep(30)
-
-                a = None
-                user, dir, file = None, None, None
-                main_queue_flag = None
-
-                # Having higher priority for the tasks that need to be recovered
-                if recovery_queue.length() != 0:
-                    with recover_lock:
-                        a = recovery_queue.check()
-                    user, dir, file = a.user, a.dir, a.file
-                    main_queue_flag = False
-                else:
-                    with lock:
-                        a = main_queue.check()
-                    user, dir, file = a.user, a.dir, a.file
-                    main_queue_flag = True
-                        
-                command = f"cd {dir} ; cat {file}"
-                ret = subprocess.run(command, capture_output=True, shell=True)
-                commands = ret.stdout.decode()
-                commands_to_execute = commands.split("\n")
-
-                # finding conda environment name
-                env_name = None
-                for command in commands_to_execute:
-                    if "activate" in command:
-                        env_name = commands_to_execute[1].split("activate")[1].strip()
-                        break
-                if env_name == None:
-                        env_name = "tf"
-
-                # enabling the conda environment
-                environment = f"/home/{user}/.conda/envs/{env_name}"
-                print("environment: ", env_name, environment)
-
-                # finding the python code to execute 
-                command_to_execute = None
-                for command in commands_to_execute:
-                    if "python" in command:
-                        command_to_execute = command
-                        break
-                if command_to_execute == None:
-                    print("the command could not be found in the submitted job profile!")
-
-                print("command to execute found: ", command_to_execute)
 
                 # gpu memory requirement
                 gpu_memory_requirement = int(commands_to_execute[8])
 
                 print("memory requirement: ", gpu_memory_requirement)
 
-                # Finding the GPUs that the task can have :)
-                gpus_with_metrics = monitor.Gmetrics
-                
-                # ==============================
-                # ====== condition 1 for filtering the GPUs based on the GPU memory requirement/ util
-                # ==============================
-                temp_ = gpus_with_metrics.loc[(gpus_with_metrics['GPU_mem_available']) >= (gpu_memory_requirement + 2000)]
-                candidate_gpus = temp_.loc[gpus_with_metrics['smact'] <= 0.8]
-
-                print("candidate GPUs:\n", candidate_gpus)
-
-                if candidate_gpus.empty:
-                    print("No GPUs to submit job to!")
-                    continue
-                else:
-                    print("The gpus that we can send job to :) \n", candidate_gpus)
-
-                # ===============
-                # condition 2: checking for the number of GPUs requested
-                # ===============
-                number_of_GPUs_requested = int(commands_to_execute[7])
-                print("number of gpus requested: ", number_of_GPUs_requested)
-
-                if len(candidate_gpus) < number_of_GPUs_requested:
-                    print("Not enough GPUs to submit the task to!")
-                    continue
-                else:
-                    print("The gpus that we can send the task to: \n", candidate_gpus)
-
-                now = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-
-                # sorting the gpus based on their utilization in an ascending way
-                sorted = candidate_gpus.sort_values(by="smact", kind="mergesort")
-                print("gpus sorted based on their available memory:\n", sorted)    
-                assigned_gpus = sorted.head(number_of_GPUs_requested)
-
-                print("assigned GPUs: ", assigned_gpus)
-                a.set_service_time(now)
-                a.set_status("dispatched")
-                    
-                gpus_identifiers = ""
-                for gpu in assigned_gpus.index:
-                    if len(gpus_identifiers) > 0:
-                        gpus_identifiers += f",{gpu}"
-
-                    else:
-                        gpus_identifiers += f"{gpu}"
-
-                # /////////////////////////////////////////////////////////////////////////////////
-                # /////////////////////////////////////////////////////////////////////////////////
-
-                # writing logs to the system log
-                now = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-
-                logging.info(f"dispatched {a.task_id} - {gpus_identifiers}")
-
-                # generating the command that will execute
-                command = f"""cd {dir} ; . /opt/anaconda/etc/profile.d/conda.sh ; conda activate {environment} ; export CUDA_VISIBLE_DEVICES={gpus_identifiers} ; {{ time {command_to_execute} 1> out-{now}-{a.task_id}.log 2>> err-{now}-{a.task_id}.log ; }} 2> time-{now}-{a.task_id}.et & pid=$!
-                    wait $pid
-                    if [ $? -eq 0 ]; then
-                        echo 'Successful' >> err-{now}-{a.task_id}.log
-                    else
-                        echo 'unsuccessful' >>  err-{now}-{a.task_id}.log
-                    fi"""
-                
-                to_write = f'echo "{dir}+{environment}+{command_to_execute}+{file}+{user}+{a.task_id}" > err-{now}-{a.task_id}.log'
-
-
-                if main_queue_flag == True:
-                    with lock:
-                        main_queue.dequeue()
-                else:
-                    with recover_lock:
-                        recovery_queue.dequeue()
-
-                Thread(target = command_executor, args=(to_write,)).start()
-                Thread(target = command_executor, args=(command,)).start()
-                
-                time_point = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-                print(time_point, "ORACLE least gpu utilized!")
-
-                
-                continue
-
-            # ========================================================================================
-            # =========================== MOST GPU MEMORY AVAILABLE =============================
-            # ========================================================================================
-            # === This policy collocates without knowing the GMem, relying on the recovery method =====
-            # ================================ for OOMs  ==============================
-            # ========================================================================================
-            elif policy == "most-GMem-available-RR" and recovery_queue.length() == 0:
-                print("most gpu memory available RR")
-
-                print("waiting for 30 seconds so the behavior of tasks can stabilize ...")
-                time.sleep(30)
-
-                a = None
-                user, dir, file = None, None, None
-                main_queue_flag = None
-
-                # Having higher priority for the tasks that need to be recovered
-                if recovery_queue.length() != 0:
-                    with recover_lock:
-                        a = recovery_queue.check()
-                    user, dir, file = a.user, a.dir, a.file
-                    main_queue_flag = False
-                else:
-                    with lock:
-                        a = main_queue.check()
-                    user, dir, file = a.user, a.dir, a.file
-                    main_queue_flag = True
-
-                        
-                command = f"cd {dir} ; cat {file}"
-                ret = subprocess.run(command, capture_output=True, shell=True)
-                commands = ret.stdout.decode()
-                commands_to_execute = commands.split("\n")
-
-                # finding conda environment name
-                env_name = None
-                for command in commands_to_execute:
-                    if "activate" in command:
-                        env_name = commands_to_execute[1].split("activate")[1].strip()
-                        break
-                if env_name == None:
-                        env_name = "tf"
-
-                # enabling the conda environment
-                environment = f"/home/{user}/.conda/envs/{env_name}"
-                print("environment: ", env_name, environment)
-
-                # finding the python code to execute 
-                command_to_execute = None
-                for command in commands_to_execute:
-                    if "python" in command:
-                        command_to_execute = command
-                        break
-                if command_to_execute == None:
-                    print("the command could not be found in the submitted job profile!")
-
-                print("command to execute found: ", command_to_execute)
-
-                # gpu memory requirement
-                # gpu_memory_requirement = int(commands_to_execute[8])
-
-                # print("memory requirement: ", gpu_memory_requirement)
                 # getting the monitored data about the server's GPUs
-                gpus_with_metrics = monitor.Gmetrics
+                gpus_with_metrics = monitor.analyze_Gmetrics()
                 
-
-                # making sure that none of them are executing the multi-GPU tasks
-                # the multi-gpu tasks are: xlnet, gpt2
-                # we should take them out of the gpus that are gonna be candidate :)
-                # multi_gpu_tasks_involved_gpus = process_detector.find_python_scripts()
-
-                # if len(multi_gpu_tasks_involved_gpus) > 0:
-                #     for gpu_uuids_to_remove in multi_gpu_tasks_involved_gpus:
-                #         gpus_with_metrics = gpus_with_metrics.drop(index=gpu_uuids_to_remove, errors='ignore')
+                print(gpus_with_metrics)
 
 
                 # Finding the GPUs that the task can get
                 # ===============
                 # condition 1 for filtering the GPUs based on the GPU memory requirement/ util
                 # ===============
-                temp_ = gpus_with_metrics.loc[(gpus_with_metrics['GPU_mem_available']) >= 2000]
-                candidate_gpus = temp_.loc[gpus_with_metrics['smact'] <= 0.80]
 
-                # candidate_gpus = gpus_with_metrics
+                # Single-threshold policy (0–1 scale from DCGM)
+                THR_SMACT = 0.80   # SMs quite busy
+                THR_SMOCC = 0.45   # many resident warps
+                THR_DRAMA = 0.40   # memory interface busy
 
-                print("candidate GPUs:\n", candidate_gpus)
+                temp_ = gpus_with_metrics.loc[
+                    gpus_with_metrics['GPU_mem_available'] >= (gpu_memory_requirement + 2048)
+                ]
+
+                candidate_gpus = temp_.loc[
+                    ~(
+                        (temp_['smact'] >= THR_SMACT)
+                        & (
+                            (temp_['smocc'] >= THR_SMOCC)
+                            | (temp_['drama'] >= THR_DRAMA)
+                        )
+                    )
+                ].copy()
+
+                # Keep only GPUs currently marked "available" by the availability logic
+                avail = set(all_available_GPUs())
+                candidate_gpus = candidate_gpus.loc[candidate_gpus.index.isin(avail)].copy()
+
+                print(gpus_state)
+
+                print("candidate and available GPUs:\n", candidate_gpus)
 
                 if candidate_gpus.empty:
                     print("no candidate gpus at all!")
@@ -1150,7 +1083,7 @@ def scheduler(policy = "round-robin"):
                 
                 now = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
 
-                # SORTING THE GPUS TO PRIORITIZE THE ONES WITH THE MOST GPU MEMORY
+                # SORTING THE GPUS TO PRIORITIZE THE ONES WITH THE MOST AVAILABLE GPU MEMORY
                 sorted = candidate_gpus.sort_values(by="GPU_mem_available", ascending=False, kind="mergesort")
                 assigned_gpus = sorted.head(number_of_GPUs_requested)
 
@@ -1166,27 +1099,10 @@ def scheduler(policy = "round-robin"):
                     else:
                         gpus_identifiers += f"{gpu}"
 
-                # /////////////////////////////////////////////////////////////////////////////////
-                # /////////////////////////////////////////////////////////////////////////////////
 
-                # writing logs to the system log
-                logging.info(f"dispatched {a.task_id} - {gpus_identifiers}")
+                # generating the command that will execute
+                command = command_generator(dir, gpus_identifiers, command_to_execute, now, a)
 
-                # Generating the command that will execute
-                command = f"""cd {dir} ; . /opt/anaconda/etc/profile.d/conda.sh ; conda activate {environment} ; export CUDA_VISIBLE_DEVICES={gpus_identifiers} ; {{ time {command_to_execute} 1> out-{now}-{a.task_id}.log 2>> err-{now}-{a.task_id}.log ; }} 2> time-{now}-{a.task_id}.et & pid=$!
-                    wait $pid
-                    if [ $? -eq 0 ]; then
-                        echo 'Successful' >> err-{now}-{a.task_id}.log
-                    else
-                        echo 'unsuccessful' >>  err-{now}-{a.task_id}.log
-                    fi"""
-                
-                to_write = f'echo "{dir}+{environment}+{command_to_execute}+{file}+{user}+{a.task_id}" > err-{now}-{a.task_id}.log'
-                
-                # now as we are here, shows that we have passed the conditions of having both 
-                # enough number of GPUs, and enought GPU memory
-
-                
                 if main_queue_flag == True:
                     with lock:
                         main_queue.dequeue()
@@ -1194,41 +1110,217 @@ def scheduler(policy = "round-robin"):
                     with recover_lock:
                         recovery_queue.dequeue()
 
+                to_write = f'echo "{dir}+{environment}+{command_to_execute}+{task}+{user}+{a.task_id}" > {dir}/err-{now}-{a.task_id}.log'
+
+                logging.info(f"dispatched {a.task_id} - {gpus_identifiers}")
+
                 Thread(target = command_executor, args=(to_write,)).start()
-                Thread(target = command_executor, args=(command,)).start()
+                pid = launch_and_get_pid(command)
                 
+                if pid is None:
+                    logging.error(f"Failed to capture PID for {a.task_id}; leaving GPUs available")
+                else:
+                    # Immediately mark these GPUs unavailable using the launcher PID
+                    for gpu_uuid in assigned_gpus.index:
+                        launch_task(gpu_uuid, pid)
+
+                    # Resolve real GPU-using PID in the background and update state when found
+                    Thread(
+                        target=_async_resolve_and_update,
+                        args=(pid, list(assigned_gpus.index)),
+                        daemon=True
+                    ).start()
+                
+                # print(gpus_state)
+
                 # just a message
                 time_point = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-                print(time_point, "MOST GPU MEMORY AVAILABLE relyaing on exclusive Recovery method")
+                print(time_point, "Oracle-MAGM Collocated task on GPUs")
 
                 continue
+
+            # =========================================================================
+            # ============================== Oracle - LUG =============================
+            # =========================================================================
+            # =========================================================================
+
+            elif policy == "oracle-LUG" and (main_queue.length() != 0 and recovery_queue.length() == 0):
+
+                a = None
+                user, dir, task = None, None, None
+                main_queue_flag = None
+
+                # Having higher priority for the tasks that need to be recovered
+                if recovery_queue.length() != 0:
+                    with recover_lock:
+                        a = recovery_queue.check()
+                    user, dir, task = a.user, a.dir, a.task
+                    main_queue_flag = False
+                else:
+                    with lock:
+                        a = main_queue.check()
+                    user, dir, task = a.user, a.dir, a.task
+                    main_queue_flag = True
+                        
+                command = f"cat {task}"
+                print("this is what we want to parse and work on and collocate: ", task, command)
+                ret = subprocess.run(command, capture_output=True, shell=True)
+                commands = ret.stdout.decode()
+                commands_to_execute = commands.split("\n")
+
+                # finding conda environment name
+                env_name = None
+                for command in commands_to_execute:
+                    if "activate" in command:
+                        env_name = commands_to_execute[1].split("activate")[1].strip()
+                        break
+                if env_name == None:
+                        env_name = "tf"
+
+                # enabling the conda environment
+                environment = f"/opt/miniconda3/envs/{env_name}"
+                print("environment: ", env_name, environment)
+
+                # finding the python code to execute 
+                command_to_execute = None
+                for command in commands_to_execute:
+                    if "python" in command:
+                        command_to_execute = command
+                        break
+                if command_to_execute == None:
+                    print("the command could not be found in the submitted job profile!")
+
+                # gpu memory requirement
+                gpu_memory_requirement = int(commands_to_execute[8])
+
+                print("memory requirement: ", gpu_memory_requirement)
+
+                # getting the monitored data about the server's GPUs
+                gpus_with_metrics = monitor.analyze_Gmetrics()
+                print(gpus_with_metrics)
+                
+                # Single-threshold policy (0–1 scale from DCGM)
+                THR_SMACT = 0.80   # SMs quite busy
+                THR_SMOCC = 0.45   # many resident warps
+                THR_DRAMA = 0.40   # memory interface busy
+
+                # condition 1: mem + utilization screen
+                temp_ = gpus_with_metrics.loc[
+                    gpus_with_metrics['GPU_mem_available'] >= (gpu_memory_requirement + 2048)
+                ]
+
+                candidate_gpus = temp_.loc[
+                        ~(
+                            (temp_['smact'] >= THR_SMACT)
+                            & (
+                                (temp_['smocc'] >= THR_SMOCC)
+                                | (temp_['drama'] >= THR_DRAMA)
+                            )
+                        )
+                    ].copy()
+                
+                # Keep only GPUs currently marked "available" by the availability logic
+                avail = set(all_available_GPUs())
+                candidate_gpus = candidate_gpus.loc[candidate_gpus.index.isin(avail)].copy()
+
+                print(gpus_state)
+                print("candidate and available GPUs:\n", candidate_gpus)
+
+                if candidate_gpus.empty:
+                    print("no candidate gpus at all!")
+                    continue
+
+                # condition 2: number of GPUs requested
+                number_of_GPUs_requested = int(commands_to_execute[7])
+                print("number of gpus requested: ", number_of_GPUs_requested)
+
+                if len(candidate_gpus) < number_of_GPUs_requested:
+                    print("Not enough GPUs to submit the task to!")
+                    continue
+                else:
+                    print("The gpus that we can send the task to: \n", candidate_gpus)
+
+                now = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+
+                # LUG: sort by smact ascending (least utilized first)
+                sorted_ = candidate_gpus.sort_values(by="smact", ascending=True, kind="mergesort")
+                assigned_gpus = sorted_.head(number_of_GPUs_requested)
+
+                print("assigned GPUs: ", assigned_gpus)
+                a.set_service_time(now)
+                a.set_status("dispatched")
+                    
+                gpus_identifiers = ""
+                for gpu in assigned_gpus.index:
+                    if len(gpus_identifiers) > 0:
+                        gpus_identifiers += f",{gpu}"
+
+                    else:
+                        gpus_identifiers += f"{gpu}"
+
+                # generating the command that will execute
+                command = command_generator(dir, gpus_identifiers, command_to_execute, now, a)
+
+                if main_queue_flag is True:
+                    with lock:
+                        main_queue.dequeue()
+                else:
+                    with recover_lock:
+                        recovery_queue.dequeue()
+                
+                to_write = f'echo "{dir}+{environment}+{command_to_execute}+{task}+{user}+{a.task_id}" > {dir}/err-{now}-{a.task_id}.log'
+
+                logging.info(f"dispatched {a.task_id} - {gpus_identifiers}")
+
+
+                Thread(target=command_executor, args=(to_write,)).start()
+                pid = launch_and_get_pid(command)
+
+                if pid is None:
+                    logging.error(f"Failed to capture PID for {a.task_id}; leaving GPUs available")
+                else:
+                    # Immediately mark these GPUs unavailable using the launcher PID
+                    for gpu_uuid in assigned_gpus.index:
+                        launch_task(gpu_uuid, pid)
+
+                    # Resolve real GPU-using PID in the background and update state when found
+                    Thread(
+                        target=_async_resolve_and_update,
+                        args=(pid, list(assigned_gpus.index)),
+                        daemon=True
+                    ).start()
+
+                time_point = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+                print(time_point, "Oracle-LUG Collocated task on GPUs")
+
+
+                continue
+
 
             # ========================================================================================
             # =========================== Round Robin with Recovery ==================================
             # ========================================================================================
-            elif policy == "round-robin" and recovery_queue.length() == 0:
-                print("round robin")
-                print("waiting for 30 seconds so the behavior of tasks can stabilize ...")
-                time.sleep(30)
+            elif policy == "OR-RR" and (main_queue.length() != 0 and recovery_queue.length() == 0):
 
                 a = None
-                user, dir, file = None, None, None
+                user, dir, task = None, None, None
                 main_queue_flag = None
 
                 # Having higher priority for the tasks that need to be recovered
                 if recovery_queue.length() != 0:
                     with recover_lock:
                         a = recovery_queue.check()
-                    user, dir, file = a.user, a.dir, a.file
+                    user, dir, task = a.user, a.dir, a.task
                     main_queue_flag = False
                 else:
                     with lock:
                         a = main_queue.check()
-                    user, dir, file = a.user, a.dir, a.file
+                    user, dir, task = a.user, a.dir, a.task
                     main_queue_flag = True
 
                         
-                command = f"cd {dir} ; cat {file}"
+                command = f"cat {task}"
+                print("this is what we want to parse and work on and collocate: ", task, command)
                 ret = subprocess.run(command, capture_output=True, shell=True)
                 commands = ret.stdout.decode()
                 commands_to_execute = commands.split("\n")
@@ -1243,8 +1335,8 @@ def scheduler(policy = "round-robin"):
                         env_name = "tf"
 
                 # enabling the conda environment
-                environment = f"/home/{user}/.conda/envs/{env_name}"
-                print("environment: ", env_name, environment)
+                environment = f"/opt/miniconda3/envs/{env_name}"
+                print("conda environment to activate: ", env_name, environment)
 
                 # finding the python code to execute 
                 command_to_execute = None
@@ -1253,18 +1345,40 @@ def scheduler(policy = "round-robin"):
                         command_to_execute = command
                         break
                 if command_to_execute == None:
-                    print("the command could not be found in the submitted job profile!")
+                    print("the command could not be found in the submitted job profile!", task)
 
-                print("command to execute found: ", command_to_execute)
 
                 number_of_GPUs_requested = int(commands_to_execute[7])
                 print("number of gpus requested: ", number_of_GPUs_requested)
 
                 now = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
 
-                assigned_gpus = select_ids(number_of_GPUs_requested)
+                avail = set(all_available_GPUs())
+                assigned_gpus = []
 
+                print(gpus_state)
+
+                print("available GPUs: ", avail)
+
+                # single pass over the whole RR ring
+                N = len(GPU_IDs)
+                seen = set()   
+
+                while len(assigned_gpus) < number_of_GPUs_requested and len(seen) < N:
+                    gid = next(round_robin_generator)  # RR pick
+                    if gid in seen:
+                        continue
+                    seen.add(gid)
+                    if gid in avail and gid not in assigned_gpus:
+                        assigned_gpus.append(gid)                             
+
+                if len(assigned_gpus) < number_of_GPUs_requested:
+                    print("OR-RR: not enough available GPUs in this RR pass; skipping dispatch.")
+                    continue
+                
+                
                 print("assigned GPUs: ", assigned_gpus)
+
                 a.set_service_time(now)
                 a.set_status("dispatched")
                     
@@ -1276,27 +1390,14 @@ def scheduler(policy = "round-robin"):
                     else:
                         gpus_identifiers += f"{gpu}"
 
-                # /////////////////////////////////////////////////////////////////////////////////
-                # /////////////////////////////////////////////////////////////////////////////////
-
-                # writing logs to the system log
+                
+                # generating the command that will execute
+                command = command_generator(dir, gpus_identifiers, command_to_execute, now, a)
+                
+                to_write = f'echo "{dir}+{environment}+{command_to_execute}+{task}+{user}+{a.task_id}" > {dir}/err-{now}-{a.task_id}.log'
+                
                 logging.info(f"dispatched {a.task_id} - {gpus_identifiers}")
 
-                # Generating the command that will execute
-                command = f"""cd {dir} ; . /opt/anaconda/etc/profile.d/conda.sh ; conda activate {environment} ; export CUDA_VISIBLE_DEVICES={gpus_identifiers} ; {{ time {command_to_execute} 1> out-{now}-{a.task_id}.log 2>> err-{now}-{a.task_id}.log ; }} 2> time-{now}-{a.task_id}.et & pid=$!
-                    wait $pid
-                    if [ $? -eq 0 ]; then
-                        echo 'Successful' >> err-{now}-{a.task_id}.log
-                    else
-                        echo 'unsuccessful' >>  err-{now}-{a.task_id}.log
-                    fi"""
-                
-                to_write = f'echo "{dir}+{environment}+{command_to_execute}+{file}+{user}+{a.task_id}" > err-{now}-{a.task_id}.log'
-                
-                # now as we are here, shows that we have passed the conditions of having both 
-                # enough number of GPUs, and enought GPU memory
-
-                
                 if main_queue_flag == True:
                     with lock:
                         main_queue.dequeue()
@@ -1304,44 +1405,53 @@ def scheduler(policy = "round-robin"):
                     with recover_lock:
                         recovery_queue.dequeue()
 
-                Thread(target = command_executor, args=(to_write,)).start()
-                Thread(target = command_executor, args=(command,)).start()
-                
+                Thread(target=command_executor, args=(to_write,)).start()
+                pid = launch_and_get_pid(command)
+            
+                if pid is None:
+                    logging.error(f"Failed to capture PID for {a.task_id}; leaving GPUs available")
+                else:
+                    # Immediately mark these GPUs unavailable using the launcher PID
+                    for gpu_uuid in assigned_gpus:
+                        launch_task(gpu_uuid, pid)
+                    
+                    # Resolve real GPU-using PID in the background and update state when found
+                    Thread(
+                        target=_async_resolve_and_update,
+                        args=(pid, list(assigned_gpus)),
+                        daemon=True
+                    ).start()
+
                 # just a message
                 time_point = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-                print(time_point, "round robin relyaing on exclusive Recovery method")
+                print(time_point, "Only Recovery - Round Robin Collocated!")
 
                 continue
 
-            # =========================================================================
-            # =========================================================================
-            # ================== Least utilized GPUs are prioritized ==================
-            # =========================================================================
-            # =========================================================================
-
-            elif policy == "least_GPU_utilized-RR" and recovery_queue.length() == 0:
-                print("least utilized GPU")
-
-                print("waiting for 30 seconds so the behavior of tasks can stabilize ...")
-                time.sleep(30)
+            # ============================================================================
+            # =========================== OR - MAGM ======================================
+            # ============================================================================
+            elif policy == "OR-MAGM" and (main_queue.length() != 0 and recovery_queue.length() == 0):
 
                 a = None
-                user, dir, file = None, None, None
+                user, dir, task = None, None, None
                 main_queue_flag = None
 
                 # Having higher priority for the tasks that need to be recovered
                 if recovery_queue.length() != 0:
                     with recover_lock:
                         a = recovery_queue.check()
-                    user, dir, file = a.user, a.dir, a.file
+                    user, dir, task = a.user, a.dir, a.task
                     main_queue_flag = False
                 else:
                     with lock:
                         a = main_queue.check()
-                    user, dir, file = a.user, a.dir, a.file
+                    user, dir, task = a.user, a.dir, a.task
                     main_queue_flag = True
+
                         
-                command = f"cd {dir} ; cat {file}"
+                command = f"cat {task}"
+                print("this is what we want collocate: ", task, command)
                 ret = subprocess.run(command, capture_output=True, shell=True)
                 commands = ret.stdout.decode()
                 commands_to_execute = commands.split("\n")
@@ -1356,7 +1466,169 @@ def scheduler(policy = "round-robin"):
                         env_name = "tf"
 
                 # enabling the conda environment
-                environment = f"/home/{user}/.conda/envs/{env_name}"
+                environment = f"/opt/miniconda3/envs/{env_name}"
+                print("environment: ", env_name, environment)
+
+                # finding the python code to execute 
+                command_to_execute = None
+                for command in commands_to_execute:
+                    if "python" in command:
+                        command_to_execute = command
+                        break
+                if command_to_execute == None:
+                    print("the command could not be found in the submitted job profile!", task)
+
+
+                # getting the monitored data about the server's GPUs
+                gpus_with_metrics = monitor.analyze_Gmetrics()
+                print(gpus_with_metrics)
+
+                # ===== Filtering =====
+                # Thresholds (same as MAGM)
+                THR_SMACT = 0.80
+                THR_SMOCC = 0.45
+                THR_DRAMA = 0.40
+
+                # 1) Fixed available-memory screen: keep GPUs with >= 5GB (5120 MiB) free
+                temp_ = gpus_with_metrics.loc[
+                    gpus_with_metrics['GPU_mem_available'] >= 5120
+                ]
+
+                # 2) Utilization screen (exclude "hot" GPUs)
+                candidate_gpus = temp_.loc[
+                    ~(
+                        (temp_['smact'] >= THR_SMACT)
+                        & (
+                            (temp_['smocc'] >= THR_SMOCC)
+                            | (temp_['drama'] >= THR_DRAMA)
+                        )
+                    )
+                ].copy()
+
+                # 3) Availability screen (must be currently available)
+                avail = set(all_available_GPUs())
+                candidate_gpus = candidate_gpus.loc[candidate_gpus.index.isin(avail)].copy()
+
+
+                print(gpus_state)
+                print("candidate and available GPUs:\n", candidate_gpus)
+
+                print("candidate GPUs:\n", candidate_gpus)
+
+                if candidate_gpus.empty:
+                    print("no candidate gpus at all!")
+                    continue
+                
+
+                # ensure enough GPUs
+                number_of_GPUs_requested = int(commands_to_execute[7])
+                print("number of gpus requested: ", number_of_GPUs_requested)
+
+
+                if len(candidate_gpus) < number_of_GPUs_requested:
+                    print("Not enough GPUs to submit the task to!")
+                    continue
+                else:
+                    print("The gpus that we can send the task to: \n", candidate_gpus)
+                
+                now = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+
+                # Sort by most available GPU memory (desc), pick top-k
+                sorted_ = candidate_gpus.sort_values(by="GPU_mem_available", ascending=False, kind="mergesort")
+                assigned_gpus = sorted_.head(number_of_GPUs_requested)
+
+                print("assigned GPUs: ", assigned_gpus)
+                a.set_service_time(now)
+                a.set_status("dispatched")
+                    
+                gpus_identifiers = ""
+                for gpu in assigned_gpus.index:
+                    if len(gpus_identifiers) > 0:
+                        gpus_identifiers += f",{gpu}"
+
+                    else:
+                        gpus_identifiers += f"{gpu}"
+
+                # generating the command that will execute
+                command = command_generator(dir, gpus_identifiers, command_to_execute, now, a)
+                
+                if main_queue_flag is True:
+                    with lock:
+                        main_queue.dequeue()
+                else:
+                    with recover_lock:
+                        recovery_queue.dequeue()
+
+
+                to_write = f'echo "{dir}+{environment}+{command_to_execute}+{task}+{user}+{a.task_id}" > {dir}/err-{now}-{a.task_id}.log'
+                
+                logging.info(f"dispatched {a.task_id} - {gpus_identifiers}")
+
+                Thread(target=command_executor, args=(to_write,)).start()
+                pid = launch_and_get_pid(command)
+
+
+                if pid is None:
+                    logging.error(f"Failed to capture PID for {a.task_id}; leaving GPUs available")
+                else:
+                    # Immediately mark these GPUs unavailable using the launcher PID
+                    for gpu_uuid in assigned_gpus.index:
+                        launch_task(gpu_uuid, pid)
+
+                    # Resolve real GPU-using PID in the background and update state when found
+                    Thread(
+                        target=_async_resolve_and_update,
+                        args=(pid, list(assigned_gpus.index)),
+                        daemon=True
+                    ).start()
+
+                # just a message
+                time_point = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+                print(time_point, "OR-MAGM (>= 5GB free) collocated task on GPUs.")
+
+                continue
+
+            # ============================================
+            # ============================================
+            # ================== OR-LUG ==================
+            # ============================================
+            # ============================================
+
+            elif policy == "OR-LUG" and (main_queue.length() != 0 and recovery_queue.length() == 0):
+
+                a = None
+                user, dir, task = None, None, None
+                main_queue_flag = None
+
+                # Having higher priority for the tasks that need to be recovered
+                if recovery_queue.length() != 0:
+                    with recover_lock:
+                        a = recovery_queue.check()
+                    user, dir, task = a.user, a.dir, a.task
+                    main_queue_flag = False
+                else:
+                    with lock:
+                        a = main_queue.check()
+                    user, dir, task = a.user, a.dir, a.task
+                    main_queue_flag = True
+                        
+                command = f"cat {task}"
+                print("this is what we want to parse and work on and collocate: ", task, command)
+                ret = subprocess.run(command, capture_output=True, shell=True)
+                commands = ret.stdout.decode()
+                commands_to_execute = commands.split("\n")
+
+                # finding conda environment name
+                env_name = None
+                for command in commands_to_execute:
+                    if "activate" in command:
+                        env_name = commands_to_execute[1].split("activate")[1].strip()
+                        break
+                if env_name == None:
+                        env_name = "tf"
+
+                # enabling the conda environment
+                environment = f"/opt/miniconda3/envs/{env_name}"
                 print("environment: ", env_name, environment)
 
                 # finding the python code to execute 
@@ -1368,26 +1640,42 @@ def scheduler(policy = "round-robin"):
                 if command_to_execute == None:
                     print("the command could not be found in the submitted job profile!")
 
-                print("command to execute found: ", command_to_execute)
 
-                # Finding the GPUs that the task can have :)
-                gpus_with_metrics = monitor.Gmetrics
+                # getting the monitored data about the server's GPUs
+                gpus_with_metrics = monitor.analyze_Gmetrics()
+                print(gpus_with_metrics)
                 
-                # ==============================
-                # ====== condition 1 for filtering the GPUs having at least 5 gig and utilized less than 80%
-                # ==============================
-                
-                temp_ = gpus_with_metrics.loc[gpus_with_metrics['GPU_mem_available'] >= 2000]
-                candidate_gpus = temp_.loc[gpus_with_metrics['smact'] <= 0.8]
+                # Single-threshold policy
+                THR_SMACT = 0.80   # SMs quite busy
+                THR_SMOCC = 0.45   # many resident warps
+                THR_DRAMA = 0.40   # memory interface busy
 
-                print("candidate GPUs:\n", candidate_gpus)
+                # === Memory filter only: keep GPUs with >= 5GB available ===
+                temp_ = gpus_with_metrics.loc[gpus_with_metrics['GPU_mem_available'] >= 5120]
+
+                # utilization screen (same as before)
+                candidate_gpus = temp_.loc[
+                    ~(
+                        (temp_['smact'] >= THR_SMACT)
+                        & (
+                            (temp_['smocc'] >= THR_SMOCC)
+                            | (temp_['drama'] >= THR_DRAMA)
+                        )
+                    )
+                ].copy()
+
+                # Keep only GPUs currently marked "available" by the availability logic
+                avail = set(all_available_GPUs())
+                candidate_gpus = candidate_gpus.loc[candidate_gpus.index.isin(avail)].copy()
+
+
+                print(gpus_state)
+                print("candidate and available GPUs:\n", candidate_gpus)
+
 
                 if candidate_gpus.empty:
                     print("No GPUs to submit job to!")
                     continue
-                else:
-                    print("The gpus that we can send job to :) \n", candidate_gpus)
-
 
                 # ===============
                 # condition 2: checking for the number of GPUs requested
@@ -1401,11 +1689,190 @@ def scheduler(policy = "round-robin"):
                 else:
                     print("The gpus that we can send the task to: \n", candidate_gpus)
 
+                # LUG: sort by smact ascending (least utilized first)
+                sorted_ = candidate_gpus.sort_values(by="smact", ascending=True, kind="mergesort")   
+                assigned_gpus = sorted_.head(number_of_GPUs_requested)
+
+                print("assigned GPUs: ", assigned_gpus)
+                a.set_service_time(now)
+                a.set_status("dispatched")
+                    
+                gpus_identifiers = ""
+                for gpu in assigned_gpus.index:
+                    if len(gpus_identifiers) > 0:
+                        gpus_identifiers += f",{gpu}"
+
+                    else:
+                        gpus_identifiers += f"{gpu}"
+
+                # writing logs to the system log
                 now = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
 
-                # sorting the gpus based on their utilization in an ascending way
-                sorted = candidate_gpus.sort_values(by="smact", kind="mergesort")
-                print("gpus sorted based on their available memory:\n", sorted)    
+                logging.info(f"dispatched {a.task_id} - {gpus_identifiers}")
+
+                # generating the command that will execute
+                command = command_generator(dir, gpus_identifiers, command_to_execute, now, a)
+
+                if main_queue_flag is True:
+                    with lock:
+                        main_queue.dequeue()
+                else:
+                    with recover_lock:
+                        recovery_queue.dequeue()
+
+                to_write = f'echo "{dir}+{environment}+{command_to_execute}+{task}+{user}+{a.task_id}" > {dir}/err-{now}-{a.task_id}.log'
+
+
+                Thread(target=command_executor, args=(to_write,)).start()
+                pid = launch_and_get_pid(command)
+                
+                if pid is None:
+                    logging.error(f"Failed to capture PID for {a.task_id}; leaving GPUs available")
+                else:
+                    # Immediately mark these GPUs unavailable using the launcher PID
+                    for gpu_uuid in assigned_gpus.index:
+                        launch_task(gpu_uuid, pid)
+
+                    # Resolve real GPU-using PID in the background and update state when found
+                    Thread(
+                        target=_async_resolve_and_update,
+                        args=(pid, list(assigned_gpus.index)),
+                        daemon=True
+                    ).start()
+
+                time_point = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+                print(time_point, "OR-LUG collocated task on GPUs.")
+
+                
+                continue
+
+
+
+
+
+
+
+
+
+            # ========================================================================================
+            # ========================================================================================
+            # ================================ EST - MAGM ============================================
+            # ========================================================================================
+            # ========================================================================================
+            elif policy == "EST-MAGM" and (main_queue.length() != 0 and recovery_queue.length() == 0):
+
+                a = None
+                user, dir, task = None, None, None
+                main_queue_flag = None
+
+                # Having higher priority for the tasks that need to be recovered
+                if recovery_queue.length() != 0:
+                    with recover_lock:
+                        a = recovery_queue.check()
+                    user, dir, task = a.user, a.dir, a.task
+                    main_queue_flag = False
+                else:
+                    with lock:
+                        a = main_queue.check()
+                    user, dir, task = a.user, a.dir, a.task
+                    main_queue_flag = True
+
+                        
+                command = f"cat {task}"
+
+                # print(gpus_state)
+
+                print("this is what we want to parse and work on and collocate: ", task, command)
+                ret = subprocess.run(command, capture_output=True, shell=True)
+                commands = ret.stdout.decode()
+                commands_to_execute = commands.split("\n")
+
+                # finding conda environment name
+                env_name = None
+                for command in commands_to_execute:
+                    if "activate" in command:
+                        env_name = commands_to_execute[1].split("activate")[1].strip()
+                        break
+                if env_name == None:
+                        env_name = "tf"
+
+                # enabling the conda environment
+                environment = f"/opt/miniconda3/envs/{env_name}"
+                print("conda environment to activate: ", env_name, environment)
+
+                # finding the python code to execute 
+                command_to_execute = None
+                for command in commands_to_execute:
+                    if "python" in command:
+                        command_to_execute = command
+                        break
+                if command_to_execute == None:
+                    print("the command could not be found in the submitted job profile!", task)
+
+
+                # gpu memory estimation
+                gpu_memory_estimation = int(float(commands_to_execute[esIndex].strip()))
+
+                print("memory estimation: ", gpu_memory_estimation)
+
+                # getting the monitored data about the server's GPUs
+                gpus_with_metrics = monitor.analyze_Gmetrics()
+                
+                print(gpus_with_metrics)
+
+
+                # Finding the GPUs that the task can get
+                # ===============
+                # condition 1 for filtering the GPUs based on the GPU memory requirement/ util
+                # ===============
+
+                # Single-threshold policy (0–1 scale from DCGM)
+                THR_SMACT = 0.80   # SMs quite busy
+                THR_SMOCC = 0.45   # many resident warps
+                THR_DRAMA = 0.40   # memory interface busy
+
+                temp_ = gpus_with_metrics.loc[
+                    gpus_with_metrics['GPU_mem_available'] >= (gpu_memory_estimation + 2048)
+                ]
+
+                candidate_gpus = temp_.loc[
+                    ~(
+                        (temp_['smact'] >= THR_SMACT)
+                        & (
+                            (temp_['smocc'] >= THR_SMOCC)
+                            | (temp_['drama'] >= THR_DRAMA)
+                        )
+                    )
+                ].copy()
+
+                # Keep only GPUs currently marked "available" by the availability logic
+                avail = set(all_available_GPUs())
+                candidate_gpus = candidate_gpus.loc[candidate_gpus.index.isin(avail)].copy()
+
+                print(gpus_state)
+
+                print("candidate and available GPUs:\n", candidate_gpus)
+
+                if candidate_gpus.empty:
+                    print("no candidate gpus at all!")
+                    continue
+                
+                # ===============
+                # condition 2: checking for the number of GPUs requested
+                # ===============
+                number_of_GPUs_requested = int(commands_to_execute[7])
+                print("number of gpus requested: ", number_of_GPUs_requested)
+
+                if len(candidate_gpus) < number_of_GPUs_requested:
+                    print("Not enough GPUs to submit the task to!")
+                    continue
+                else:
+                    print("The gpus that we can send the task to: \n", candidate_gpus)
+                
+                now = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+
+                # SORTING THE GPUS TO PRIORITIZE THE ONES WITH THE MOST AVAILABLE GPU MEMORY
+                sorted = candidate_gpus.sort_values(by="GPU_mem_available", ascending=False, kind="mergesort")
                 assigned_gpus = sorted.head(number_of_GPUs_requested)
 
                 print("assigned GPUs: ", assigned_gpus)
@@ -1420,25 +1887,9 @@ def scheduler(policy = "round-robin"):
                     else:
                         gpus_identifiers += f"{gpu}"
 
-                # /////////////////////////////////////////////////////////////////////////////////
-                # /////////////////////////////////////////////////////////////////////////////////
-
-                # writing logs to the system log
-                now = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-
-                logging.info(f"dispatched {a.task_id} - {gpus_identifiers}")
 
                 # generating the command that will execute
-                command = f"""cd {dir} ; . /opt/anaconda/etc/profile.d/conda.sh ; conda activate {environment} ; export CUDA_VISIBLE_DEVICES={gpus_identifiers} ; {{ time {command_to_execute} 1> out-{now}-{a.task_id}.log 2>> err-{now}-{a.task_id}.log ; }} 2> time-{now}-{a.task_id}.et & pid=$!
-                    wait $pid
-                    if [ $? -eq 0 ]; then
-                        echo 'Successful' >> err-{now}-{a.task_id}.log
-                    else
-                        echo 'unsuccessful' >>  err-{now}-{a.task_id}.log
-                    fi"""
-                
-                to_write = f'echo "{dir}+{environment}+{command_to_execute}+{file}+{user}+{a.task_id}" > err-{now}-{a.task_id}.log'
-
+                command = command_generator(dir, gpus_identifiers, command_to_execute, now, a)
 
                 if main_queue_flag == True:
                     with lock:
@@ -1447,126 +1898,187 @@ def scheduler(policy = "round-robin"):
                     with recover_lock:
                         recovery_queue.dequeue()
 
+                to_write = f'echo "{dir}+{environment}+{command_to_execute}+{task}+{user}+{a.task_id}" > {dir}/err-{now}-{a.task_id}.log'
+
+                logging.info(f"dispatched {a.task_id} - {gpus_identifiers}")
+
                 Thread(target = command_executor, args=(to_write,)).start()
-                Thread(target = command_executor, args=(command,)).start()
+                pid = launch_and_get_pid(command)
                 
+                if pid is None:
+                    logging.error(f"Failed to capture PID for {a.task_id}; leaving GPUs available")
+                else:
+                    # Immediately mark these GPUs unavailable using the launcher PID
+                    for gpu_uuid in assigned_gpus.index:
+                        launch_task(gpu_uuid, pid)
+
+                    # Resolve real GPU-using PID in the background and update state when found
+                    Thread(
+                        target=_async_resolve_and_update,
+                        args=(pid, list(assigned_gpus.index)),
+                        daemon=True
+                    ).start()
+                
+                # print(gpus_state)
+
+                # just a message
                 time_point = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-                print(time_point, "Least gpu utilized!")
+                print(time_point, "Oracle-MAGM Collocated task on GPUs")
 
-                
                 continue
+            
+            # =================================================
+            # ================= EST - LUG =====================
+            # =================================================
+            elif policy == "EST-LUG" and (main_queue.length() != 0 and recovery_queue.length() == 0):
 
+                a = None
+                user, dir, task = None, None, None
+                main_queue_flag = None
 
+                # Having higher priority for the tasks that need to be recovered
+                if recovery_queue.length() != 0:
+                    with recover_lock:
+                        a = recovery_queue.check()
+                    user, dir, task = a.user, a.dir, a.task
+                    main_queue_flag = False
+                else:
+                    with lock:
+                        a = main_queue.check()
+                    user, dir, task = a.user, a.dir, a.task
+                    main_queue_flag = True
+                        
+                command = f"cat {task}"
+                print("this is what we want to parse and work on and collocate: ", task, command)
+                ret = subprocess.run(command, capture_output=True, shell=True)
+                commands = ret.stdout.decode()
+                commands_to_execute = commands.split("\n")
 
+                # finding conda environment name
+                env_name = None
+                for command in commands_to_execute:
+                    if "activate" in command:
+                        env_name = commands_to_execute[1].split("activate")[1].strip()
+                        break
+                if env_name == None:
+                        env_name = "tf"
 
+                # enabling the conda environment
+                environment = f"/opt/miniconda3/envs/{env_name}"
+                print("environment: ", env_name, environment)
 
+                # finding the python code to execute 
+                command_to_execute = None
+                for command in commands_to_execute:
+                    if "python" in command:
+                        command_to_execute = command
+                        break
+                if command_to_execute == None:
+                    print("the command could not be found in the submitted job profile!")
 
+                # gpu memory estimation
+                gpu_memory_estimation = int(float(commands_to_execute[esIndex].strip()))
 
+                print("memory requirement: ", gpu_memory_estimation)
 
+                # getting the monitored data about the server's GPUs
+                gpus_with_metrics = monitor.analyze_Gmetrics()
+                print(gpus_with_metrics)
+                
+                # Single-threshold policy (0–1 scale from DCGM)
+                THR_SMACT = 0.80   # SMs quite busy
+                THR_SMOCC = 0.45   # many resident warps
+                THR_DRAMA = 0.40   # memory interface busy
 
+                # condition 1: mem + utilization screen
+                temp_ = gpus_with_metrics.loc[
+                    gpus_with_metrics['GPU_mem_available'] >= (gpu_memory_estimation + 2048)
+                ]
 
+                candidate_gpus = temp_.loc[
+                        ~(
+                            (temp_['smact'] >= THR_SMACT)
+                            & (
+                                (temp_['smocc'] >= THR_SMOCC)
+                                | (temp_['drama'] >= THR_DRAMA)
+                            )
+                        )
+                    ].copy()
+                
+                # Keep only GPUs currently marked "available" by the availability logic
+                avail = set(all_available_GPUs())
+                candidate_gpus = candidate_gpus.loc[candidate_gpus.index.isin(avail)].copy()
 
-
-
-
-
-            # ========================================================================================
-            # =========================== LEAST UTILIZED GPU POLICY =============================
-            # ========================================================================================
-            elif policy == "least_utilized_GPU" and recovery_queue.length() == 0:
-                print("we are here, least_utilized_GPU")
-
-                time.sleep(60)
-                gpus_with_metrics = monitor.Gmetrics
-                # print("decision: \n", gpus_with_metrics)
-                temp_ = gpus_with_metrics.loc[(gpus_with_metrics['GPU_mem_available']) >= 12000]
-                candidate_gpus = temp_.loc[gpus_with_metrics['smact'] <= 0.8]
-
-                # print("candidate GPUs:\n", candidate_gpus)
-
-                sorted = candidate_gpus.sort_values(by="smact", kind="mergesort")
-
-                print("gpus sorted:\n", sorted)
+                print(gpus_state)
+                print("candidate and available GPUs:\n", candidate_gpus)
 
                 if candidate_gpus.empty:
-                    print("No GPUs to submit job to!")
+                    print("no candidate gpus at all!")
+                    continue
+
+                # condition 2: number of GPUs requested
+                number_of_GPUs_requested = int(commands_to_execute[7])
+                print("number of gpus requested: ", number_of_GPUs_requested)
+
+                if len(candidate_gpus) < number_of_GPUs_requested:
+                    print("Not enough GPUs to submit the task to!")
                     continue
                 else:
-                    print("The gpus that we can send job to :) \n", candidate_gpus)
+                    print("The gpus that we can send the task to: \n", candidate_gpus)
+
+                now = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+
+                # LUG: sort by smact ascending (least utilized first)
+                sorted_ = candidate_gpus.sort_values(by="smact", ascending=True, kind="mergesort")
+                assigned_gpus = sorted_.head(number_of_GPUs_requested)
+
+                print("assigned GPUs: ", assigned_gpus)
+                a.set_service_time(now)
+                a.set_status("dispatched")
                     
-                    # GPU selected here :)
-                    candidate_gpu_to_collocate_job = sorted.index[0]
+                gpus_identifiers = ""
+                for gpu in assigned_gpus.index:
+                    if len(gpus_identifiers) > 0:
+                        gpus_identifiers += f",{gpu}"
 
-                    print("candidate GPU: ", candidate_gpu_to_collocate_job)
+                    else:
+                        gpus_identifiers += f"{gpu}"
 
-                    # sort and finding the actual one we want to target
-                    a = None
-                    user, dir, file = None, None, None
+                # generating the command that will execute
+                command = command_generator(dir, gpus_identifiers, command_to_execute, now, a)
+
+                if main_queue_flag is True:
                     with lock:
-                        a = main_queue.dequeue()
-                        user, dir, file = a.user, a.dir, a.file
-                        a.set_service_time(datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S"))
-                        a.set_status("dispatched")
+                        main_queue.dequeue()
+                else:
+                    with recover_lock:
+                        recovery_queue.dequeue()
+                
+                to_write = f'echo "{dir}+{environment}+{command_to_execute}+{task}+{user}+{a.task_id}" > {dir}/err-{now}-{a.task_id}.log'
 
-                    command = f"cd {dir} ; cat {file}"
-                    ret = subprocess.run(command, capture_output=True, shell=True)
-                    commands = ret.stdout.decode()
-                    commands_to_execute = commands.split("\n")
+                logging.info(f"dispatched {a.task_id} - {gpus_identifiers}")
 
-                    now = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
 
-                    # finding conda environment name
-                    env_name = None
-                    for command in commands_to_execute:
-                        if "activate" in command:
-                            env_name = commands_to_execute[1].split("activate")[1].strip()
-                            break
-                    if env_name == None:
-                            env_name = "tf"
+                Thread(target=command_executor, args=(to_write,)).start()
+                pid = launch_and_get_pid(command)
 
-                    # enabling the conda environment
-                    environment = f"/home/{user}/.conda/envs/{env_name}"
-                    print(env_name, environment)
+                if pid is None:
+                    logging.error(f"Failed to capture PID for {a.task_id}; leaving GPUs available")
+                else:
+                    # Immediately mark these GPUs unavailable using the launcher PID
+                    for gpu_uuid in assigned_gpus.index:
+                        launch_task(gpu_uuid, pid)
 
-                    # finding the python code to execute 
-                    command_to_execute = None
-                    for command in commands_to_execute:
-                        if "python" in command:
-                            command_to_execute = command
-                            break
-                    if command_to_execute == None:
-                        print("the command could not be found in the submitted job profile!")
+                    # Resolve real GPU-using PID in the background and update state when found
+                    Thread(
+                        target=_async_resolve_and_update,
+                        args=(pid, list(assigned_gpus.index)),
+                        daemon=True
+                    ).start()
 
-                    print("command to execute found: ", command_to_execute)
+                time_point = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+                print(time_point, "EST-LUG Collocated task on GPUs")
 
-                    # writing logs to the system log
-                    # writing logs to the system log
-                    logging.info(f"dispatched {a.task_id} - {candidate_gpu_to_collocate_job}")
-
-                    # generating the command that will execute
-                    # command = f'cd {dir} ; . /opt/anaconda/etc/profile.d/conda.sh ; conda activate {environment} ; export CUDA_VISIBLE_DEVICES={idle_gpu_to_send_job} ; {{ time {command_to_execute} 1> out-{user}-{now}-{file}-{a.task_id}.log 2> err-{user}-{now}-{file}-{a.task_id}.log ; }} 1> time1-{user}-{now}-{file}-{a.task_id}.et 2> time2-{a.task_id}.et || echo "fail" &'
-                    command = f"""cd {dir} ; . /opt/anaconda/etc/profile.d/conda.sh ; conda activate {environment} ; export CUDA_VISIBLE_DEVICES={candidate_gpu_to_collocate_job} ; {{ time {command_to_execute} 1> out-{user}-{now}-{file}-{a.task_id}.log 2>> err-{user}-{now}-{file}-{a.task_id}.log ; }} 2> time-{user}-{now}-{file}-{a.task_id}.et & pid=$!
-                        wait $pid 
-                        if [ $? -eq 0 ]; then
-                            echo 'Successful' >> err-{user}-{now}-{file}-{a.task_id}.log
-                        else
-                            echo 'unsuccessful' >>  err-{user}-{now}-{file}-{a.task_id}.log
-                        fi
-                        """
-                    
-                    to_write = f'echo "{dir}+{environment}+{command_to_execute}+{file}+{user}+{a.task_id}" > err-{user}-{now}-{file}-{a.task_id}.log'
-
-                    # print(command)
-                    # print(to_write)
-
-                    # subprocess.run(to_write, shell=True, check=True, executable='/bin/bash')
-                    # subprocess.run(command, shell=True, check=True, executable='/bin/bash')
-                    Thread(target = command_executor, args=(to_write,)).start()
-                    Thread(target = command_executor, args=(command,)).start()
-
-                # waiting for a while til the job goes on the GPU
-                time.sleep(1)
-                print("one allocation task is done!")
 
             # ========================================================================================
             # =========================== Policy with resource estimator =============================
@@ -1700,39 +2212,23 @@ def scheduler(policy = "round-robin"):
             pass
     
     # time to check if there has been any crashes to be handled
-    
 
-header_flag_decision = True
-def system_use_utilization_logger():
-    while True:
-        # waiting to the size of monitoring window
-        time.sleep(60)
-        now = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-        gpus_with_metrics = monitor.Gmetrics
-        tmp = gpus_with_metrics.assign(time=[now]*len(gpus_with_metrics))
-        global header_flag_decision
-        if header_flag_decision == True:
-            tmp.to_csv('decision_making_monitored_data.csv', mode='a')
-            header_flag_decision = False
-        else:
-            tmp.to_csv('decision_making_monitored_data.csv', mode='a', header = False)
-
-header_flag_top = True
-def top_system_logger():
-    while True:
-        time.sleep(3)
-        a = monitor.top_extractor()
-
-        global header_flag_top
-        if header_flag_top == True:
-            a.to_csv('top_data.csv', mode='a', index = False)
-            header_flag_top = False
-        else:
-            a.to_csv('top_data.csv', mode='a', header = False, index=False)
 
 if __name__ == '__main__':
+    # server module responsible for getting tasks and queuing them
     Thread(target = server).start()
+
+    # scheduler module responsible for selecting from the queue
+    # and mapping them on the available GPUs
+    # GPU collocation happens in this 
     Thread(target = scheduler).start()
-    Thread(target = monitor.metrics).start()
-    Thread(target = system_use_utilization_logger).start()
-    Thread(target = top_system_logger).start()
+
+    # monitoring facilities
+    # module responsible for monitoring GPUs
+    # keeping latest window of monitored data updated inside "Gmetrics"
+    # to hand it over to decision making process
+    Thread(target = monitor.monitor_logger).start()
+
+    # for logging system wide statistics for further study
+    # Thread(target = system_use_utilization_logger).start()    # no need to keep this since is inaccurate
+    Thread(target = monitor.top_system_logger).start()

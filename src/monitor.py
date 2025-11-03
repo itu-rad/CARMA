@@ -1,16 +1,55 @@
 import time
 import datetime
-import csv
 import pandas as pd
 from subprocess import Popen, PIPE
-from sklearn.cluster import KMeans
 import numpy as np
+from threading import Lock
 
 import subprocess
 import io
+import csv
 
-Gmetrics = pd.DataFrame(columns=['active', 'GPU_mem_in_use', 'GPU_mem_total', 'GPU_mem_available', 'smact'])
+analyze_configuration = "risk" # can be Normal | risk
 
+# ===== Helper functions for risk concept =======
+
+def _ema_last(s, alpha):  # pd.Series -> float
+    return float(s.ewm(alpha=alpha, adjust=False).mean().iloc[-1])
+
+def _p95(s):  return float(pd.Series(s, dtype=float).quantile(0.95))
+def _cv(s):
+    x = pd.Series(s, dtype=float); m = x.mean()
+    return float(x.std(ddof=0)/m) if m and abs(m) > 1e-12 else float("nan")
+
+def _lin_slope(s):
+    y = pd.Series(s, dtype=float).to_numpy()
+    t = np.arange(len(y), dtype=float); tc = t - t.mean()
+    denom = (tc**2).sum()
+    if denom == 0.0: return 0.0
+    return float(((tc * (y - y.mean())).sum()) / denom)
+
+def _trend_flag(s, thresh=0.003, up_only=True):
+    m = _lin_slope(s)
+    return int(m > thresh) if up_only else int(abs(m) > thresh)
+
+# weights + trend threshold (tweak as you like)
+RISK_W = dict(wT=0.5, wE=0.3, wB=0.1, wC=0.1)  # T=p95, E=EMA, B=CV, C=trend_flag
+TREND_THRESH = 0.003
+TREND_UP_ONLY = True
+
+# ========= end of window risk helpers ============
+
+
+# monitoring Window of data
+# making sure that race condition does not happen
+G_LOCK = Lock()
+GV_LOCK = Lock()
+Gmetrics_are_valid = False
+Gmetrics = pd.DataFrame(columns=["gpu_uuid", "free_gpu_memory", "gpu_utilization", "gract", "smact",
+                                                     "smocc", "fp64", "fp32", "fp16", "tc",
+                                                     "memory_copy", "dram_active", "pcie_tx_bytes",
+                                                     "pcie_rx_bytes", "nvlink_tx_bytes", "nvlink_rx_bytes",
+                                                     "power", "energy", "gpu_id"])
 # executes a shell bash command and return the output
 def execute_command(cmd, shell=False, vars={}):
     """
@@ -35,7 +74,7 @@ def gpu_uuids():
     o = execute_command("nvidia-smi -L")
     o = o.split('\n')
     for line in o:
-        # ignoring the display dedicated GPU on the DGX A100 station machine
+        # Ignoring the display dedicated GPU on the DGX A100 station machine
         if "Display" in line:
             continue
         if "UUID: GPU" in line:
@@ -44,40 +83,141 @@ def gpu_uuids():
 
     return gpus
 
+# This function's responsibility is to show the list of available GPUs
+# Made sure that the MPS daemon process is not considered as being active
+# This function is used for implementing exclusive assignment of GPUs to tasks 
+# def gpus_activeness():
+#     """
+#     Analyzing 'nvidia-smi pmon -c 1' command and figuring GPUs status
+#     """
+#     gpus = gpu_uuids()
 
-# print(gpu_uuids())
+#     # reversing keys and values in gpu_uuids dictionary
+#     # to be able to find the corresponding uuid
+#     tmp_gpus = {value: key for key, value in gpus.items()}    
+#     activity_dict = dict.fromkeys(tmp_gpus, 0)
 
-# exit()
-# GPU_to_PID is a map showing which process are running on which GPUs
-GPU_to_PID = dict()
+#     # active GPUs
+#     active_GPUs = dict()
+#     out = execute_command("nvidia-smi pmon -c 1")
+#     out = out.split("\n")
 
-
-# uses nvidi-smi tool to get memory usage of each GPU
-def gpu_mem_usage():
-    """
-    output: dictionary of gpu_uuids:gpu_memory_usage
-
-    Uses nvidia-smi to monitor available GPUs' memory usage
-    """
-    result = dict()
-
-    o = execute_command("nvidia-smi --query-gpu=uuid,memory.used,memory.total --format=csv")
-    o = o.split('\n')
+#     for line in out:
+#         if line.startswith("#"):
+#             pass
+#         elif len(line) != 0:
+#             tmp_list = line.strip().split()
+#             if tmp_list[1] != '-' and tmp_list[7] != 'nvidia-cuda-mps':
+#                 print(tmp_list[7])
+#                 if tmp_list[0] in active_GPUs:
+#                     active_GPUs[tmp_list[0]].append(tmp_list[1])
+#                 else:
+#                     active_GPUs[tmp_list[0]] = [tmp_list[1]]
     
-    for line in o:
-        if line.startswith("uuid") or line == '':
-            continue
-        gpu_id, b, c = line.split(',')
-        memory_usage = b.split(' ')[1] 
-        memory_cap = c.split(' ')[1] 
-        
-        result[gpu_id] = [memory_usage, memory_cap]
+#     for active_gpu_index in active_GPUs:
+#         activity_dict[active_gpu_index] = 1
 
+#     out_dict = dict()
+
+#     for index in tmp_gpus:
+#         tmp = tmp_gpus[index]
+#         out_dict[tmp] = activity_dict[index]
+
+#     return out_dict
+
+def gpus_activeness():
+    """
+    Parse `nvidia-smi pmon -c 1` and return {gpu_uuid: 0|1}, ignoring MPS daemons.
+    0 = idle, 1 = has non-MPS process.
+    """
+    gpus = gpu_uuids()                           # {uuid: "0"/"1"/...}
+    id_by_uuid = {u: str(i) for u, i in gpus.items()}
+    active_gpu_indices = set()
+
+    out = execute_command("nvidia-smi pmon -c 1")
+    if not out:
+        # fail-safe: assume all idle
+        return {u: 0 for u in gpus.keys()}
+
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        toks = line.split()
+        if len(toks) < 3:
+            continue
+        gpu_idx, pid = toks[0], toks[1]
+        cmd = toks[-1].rstrip(",")               # last token is command (strip trailing comma)
+
+        # mark active only for real PIDs and non-MPS commands
+        if pid != "-" and cmd not in {"nvidia-cuda-mps", "nvidia-cuda-mps-control"}:
+            active_gpu_indices.add(gpu_idx)
+
+    # build uuid -> 0/1 map
+    activity = {}
+    for uuid, idx in id_by_uuid.items():
+        activity[uuid] = 1 if idx in active_gpu_indices else 0
+    return activity
+
+
+def pmon_rows():
+    """Yield dicts per PMON row: {'idx': '0','pid': '2346212','type':'M+C','cmd':'python'}"""
+    out = execute_command("nvidia-smi pmon -c 1")
+    if not out:
+        return []
+    rows = []
+
+    IGNORE = {"nvidia-cuda-mps", "nvidia-cuda-mps-control"}  # <- skip both daemons
+
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        toks = line.split()
+        if len(toks) < 3:
+            continue
+
+        cmd = toks[-1].rstrip(",")
+        if cmd in IGNORE:             # <- ignore MPS rows
+            continue
+
+        rows.append({
+            "idx": toks[0],
+            "pid": toks[1],
+            "type": toks[2],
+            "cmd": toks[-1].rstrip(","),   # strip trailing comma if exists
+        })
+    return rows
+
+# This function checks whether a key <PID> is seen in the output
+def is_in_pmon(pid: str) -> bool:
+    """True if *any* PMON row has this PID (exact match)."""
+    for r in pmon_rows():
+        if r["pid"] == pid:
+            return True
+    return False
+
+
+
+# this function is responsible for calculating EWMA
+def _ema_last(series, alpha=0.2):
+    """Return last value of EMA for a pandas Series."""
+    return series.ewm(alpha=alpha, adjust=False).mean().iloc[-1]
+
+def gpu_mem_usage():
+    # uuid, used, total, free (MiB)
+    o = execute_command(
+        "nvidia-smi --query-gpu=uuid,memory.used,memory.total,memory.free --format=csv,noheader,nounits"
+    )
+    result = {}
+    for uuid, used, total, free in csv.reader(io.StringIO(o)):
+        result[uuid.strip()] = int(free)
     return result
 
 
 
-# dcgmi monitor
+
+# This function gets the metrics from dcgmi tool
 def dcgmi_monitor():
     """
     output: dictionary of gpu_uuids:smact
@@ -114,6 +254,195 @@ def dcgmi_monitor():
 
     return result
 
+
+
+
+
+# This function is used for no-stopping monitoring of GPUs and logging them
+# also the latest monitored data gets updated here, which
+# is used for making collocation decisions
+header_flag = True
+# developed and tested
+def monitor_logger(window = 30):
+    """
+    - monitors detected GPUs with <timestep> seconds intervals for <window> number of minutes
+
+    - uses 'gpu_mem_usage()' and 'dcgmi_monitor()' functions
+    """
+    INTERVAL = 1
+    next_tick = time.monotonic()
+    
+    cols = ["gpu_uuid", "free_gpu_memory", "gpu_utilization", "gract", "smact",
+        "smocc", "fp64", "fp32", "fp16", "tc",
+        "memory_copy", "drama", "pcie_tx_bytes",
+        "pcie_rx_bytes", "nvlink_tx_bytes", "nvlink_rx_bytes",
+        "power", "energy", "gpu_id"]
+    
+    window_monitored_metrics = pd.DataFrame(columns=cols)
+
+    while(True):
+        # gather
+        # === gather ===
+        gpus = gpu_uuids()             # dict: uuid -> id
+        free_mem = gpu_mem_usage()           # dict: uuid -> [mem_used, mem_cap, util]
+        dcgm = dcgmi_monitor()         # dict: gpu_id -> [gract, smact, ... energy]
+        num_gpus = len(gpus)
+        max_rows = window * max(1, num_gpus)
+
+        temp = pd.DataFrame(columns=cols)
+        for gpu_uuid, gpu_id in gpus.items():
+            free_val = int(free_mem.get(gpu_uuid, 0))     # <- value, not dict
+            dcgm_metrics = dcgm[gpu_id]                   # length 16 (203/1001/…/156)
+            row = [gpu_uuid, free_val] + dcgm_metrics + [gpu_id]
+            window_monitored_metrics.loc[len(window_monitored_metrics)] = row
+            temp.loc[len(temp)] = row
+
+        # === trim to rolling window ===
+        if len(window_monitored_metrics) > max_rows:
+            window_monitored_metrics = window_monitored_metrics.tail(max_rows).reset_index(drop=True)
+            
+        # ---- atomic publish of a snapshot ----
+        with G_LOCK:
+                globals()["Gmetrics"] = window_monitored_metrics.copy(deep=False)
+        # --- mark as valid once the rolling window is filled (do this once) ---
+        if len(window_monitored_metrics) >= max_rows:
+            with GV_LOCK:
+                if not globals().get("Gmetrics_are_valid", False):
+                    globals()["Gmetrics_are_valid"] = True
+
+        # === csv logging (with timestamp) ===
+        now = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+        temp1 = temp.assign(time=[now] * len(temp))
+        global header_flag
+        if header_flag:
+            temp1.to_csv('dcgmi_metrics.csv', mode='a', index=False)
+            header_flag = False
+        else:
+            temp1.to_csv('dcgmi_metrics.csv', mode='a', header=False, index=False)
+
+        # === 1s tick ===
+        next_tick += INTERVAL
+        sleep_for = next_tick - time.monotonic()
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        else:
+            next_tick = time.monotonic()
+
+
+
+
+
+# This function is responsible for giving decision-making data to the collocation logic
+def analyze_Gmetrics(data=None):
+    """
+    Summarize rolling-window Gmetrics per gpu_uuid:
+      active, last mem used, total cap, available, mean smact/smocc/drama.
+    Returns a DataFrame indexed by gpu_uuid.
+    """
+    while True:
+        with GV_LOCK:
+            ready = globals().get("Gmetrics_are_valid", False)
+        if ready:
+            break
+        time.sleep(0.1)  # waits only until window fills (once at startup)
+
+    if data is None:
+        with G_LOCK:
+            data = globals()["Gmetrics"]
+
+    if data is None or data.empty:
+        return pd.DataFrame(columns=[
+            "free_gpu_memory",
+            "smact","smocc","drama"
+        ])
+
+    df = data.copy()
+    # ensure numeric dtypes
+    for c in ["free_gpu_memory","smact","smocc","drama"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    gpu_ids = gpu_uuids()              # dict: uuid -> id
+    gpus_activity = gpus_activeness()  # dict: uuid -> bool/int
+
+    grouped = df.groupby("gpu_uuid", sort=False)
+    analyzed = {}
+
+    for uuid in gpu_ids:
+        if uuid not in grouped.groups:
+            analyzed[uuid] = [gpus_activity.get(uuid, 0), np.nan, np.nan, np.nan, np.nan, np.nan, np.nan]
+            continue
+
+        g = grouped.get_group(uuid)
+        free_mem = max(0, int(g["free_gpu_memory"].iloc[-1]) - 512)
+
+        # This is for setting the alpha value according to the size of the monitoring window
+
+        W = len(g)
+        alpha = 2.0/(W+1.0) if W > 0 else 0.5  # window-aware EMA
+
+        if globals()["analyze_configuration"] == "Normal":
+            smact = g["smact"].mean()
+            smocc = g["smocc"].mean()
+            drama = g["drama"].mean()
+        elif globals()["analyze_configuration"] == "EWMA":
+            alpha = 0.5  # tweakable; ~effective window ≈ 2/(alpha)-1 samples
+            smact = _ema_last(g["smact"], alpha=alpha)
+            smocc = _ema_last(g["smocc"], alpha=alpha)
+            drama = _ema_last(g["drama"], alpha=alpha)
+        else:
+            # --- Linear Risk (mean, median, p95, p50, EMA) ---
+            # alpha already computed above from window size W
+
+            RISK_V2_W = {
+                "w_mean":   0.20,
+                "w_median": 0.20,
+                "w_p95":    0.30,
+                "w_p50":    0.10,
+                "w_ema":    0.20,
+            }
+
+            def _risk(series):
+                s = pd.to_numeric(series, errors="coerce").dropna()
+                if s.empty:
+                    return float("nan")
+                mean_v   = float(s.mean())
+                median_v = float(s.median())
+                p95_v    = float(s.quantile(0.95))
+                p50_v    = float(s.quantile(0.50))
+                ema_v    = float(_ema_last(s, alpha))
+                return (RISK_V2_W["w_mean"]   * mean_v   +
+                        RISK_V2_W["w_median"] * median_v +
+                        RISK_V2_W["w_p95"]    * p95_v    +
+                        RISK_V2_W["w_p50"]    * p50_v    +
+                        RISK_V2_W["w_ema"]    * ema_v)
+
+            smact = _risk(g["smact"])
+            smocc = _risk(g["smocc"])
+            drama = _risk(g["drama"])
+
+        analyzed[uuid] = [
+            free_mem,
+            smact,
+            smocc,
+            drama,
+        ]
+
+    out = pd.DataFrame.from_dict(
+        analyzed,
+        orient="index",
+        columns=[
+            "GPU_mem_available",
+            "smact","smocc","drama"
+        ],
+    )
+
+    print(out)
+    
+    return out
+
+
+
+# This function is responsible for monitoing system CPU and Memory usage
 def top_extractor(process_names = ["python"]):
     # they will keep the accumulative %CPU and %MEM for all wanted processes
     CPU_util = 0
@@ -157,183 +486,32 @@ def top_extractor(process_names = ["python"]):
     to_return.loc[len(to_return)] = data_to_return
     return to_return
 
-header_flag = True
-# developed and tested
-def monitor_and_log_minute_scale(log=False, timestamp=3, window=1):
-    """
-    - monitors detected GPUs with <timestep> seconds intervals for <window> number of minutes
 
-    - uses 'gpu_mem_usage()' and 'dcgmi_monitor()' functions
-    """
-    flag = True
-    start = datetime.datetime.now()
-    
-    window_monitored_metrics = pd.DataFrame(columns=["gpu_id", "gpu_uuid", "gpu_memory_usage", "gpu_memory_cap", "gpu_utilization", "gract", "smact",
-                                                     "smocc", "fp64", "fp32", "fp16", "tc",
-                                                     "memory_copy", "dram_active", "pcie_tx_bytes",
-                                                     "pcie_rx_bytes", "nvlink_tx_bytes", "nvlink_rx_bytes",
-                                                     "power", "energy"])
-
-    while(flag):
-        # ### HERE starts monitoring logic HERE ###
-        gpus = gpu_uuids()
-        gm = gpu_mem_usage()
-        dcgm = dcgmi_monitor()
-        res = []
-
-        temp = pd.DataFrame(columns=["gpu_id", "gpu_uuid", "gpu_memory_usage", "gpu_memory_cap", "gpu_utilization", "gract", "smact",
-                                                    "smocc", "fp64", "fp32", "fp16", "tc",
-                                                    "memory_copy", "dram_active", "pcie_tx_bytes",
-                                                    "pcie_rx_bytes", "nvlink_tx_bytes", "nvlink_rx_bytes",
-                                                    "power", "energy"])
-        all_metrics = []
-        for gpu_uuid in gpus:
-            gpu_id = gpus[gpu_uuid]
-            gpu_memory_info = gm[gpu_uuid]
-
-            # print(gpu_memory_info)
-
-            dcgm_metrics = dcgm[gpu_id]
-            all_metrics = [gpu_id] + [gpu_uuid] + gpu_memory_info + dcgm_metrics
-
-            window_monitored_metrics.loc[len(window_monitored_metrics)] = all_metrics
-            temp.loc[len(temp)] = all_metrics
-            
-            
-        # the logic to log not excessive rows
-        now = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-        temp1 = temp.assign(time=[now]*len(temp))
-        global header_flag
-
-        # ++++ writing to the csv log file if logging is enabled ++++
-        if header_flag == True:
-            temp1.to_csv('dcgmi_metrics.csv', mode='a', index=False)
-            header_flag = False
-        else:
-            temp1.to_csv('dcgmi_metrics.csv', mode='a', header = False, index=False)
-
-
-            # print(window_monitored_metrics)
-
-
-
-
-
-        # ### HERE ends monitoring logic HERE ###
-        # ***** HERE starts time control logic *****
-        now = datetime.datetime.now()
-        if datetime.timedelta(minutes=window) < (now - start):
-            flag = False
-        # ***** HERE ends days control logic *****
-
-        # ====== timestep for sampling logic ======
-        time.sleep(timestamp)
-    
-    return window_monitored_metrics
-
-
-def gpus_activeness():
-    """
-    Analyzing 'nvidia-smi pmon -c 1' command and figuring GPUs status
-    
-    This has the responsibility of updating GPU_to_PID global variable 
-    """
-    gpus = gpu_uuids()
-
-    # reversing keys and values in gpu_uuids dictionary
-    # to be able to find the corresponding uuid
-    tmp_gpus = {value: key for key, value in gpus.items()}    
-    activity_dict = dict.fromkeys(tmp_gpus, 0)
-
-    # active GPUs
-    active_GPUs = dict()
-    out = execute_command("nvidia-smi pmon -c 1")
-    out = out.split("\n")
-
-    
-    for line in out:
-        if line.startswith("#"):
-            pass
-        elif len(line) != 0:
-            tmp_list = line.strip().split()
-            # print(tmp_list)
-                                   # tmp_list[0] shows GPU index
-            if tmp_list[1] != '-' and tmp_list[7] != 'nvidia-cuda-mps':
-                print(tmp_list[7])
-                # tmp_list[1] contains PID of the process
-                if tmp_list[0] in active_GPUs:
-                    active_GPUs[tmp_list[0]].append(tmp_list[1])
-                    # print(active_GPUs)
-                else:
-                    # print("it has one")
-                    active_GPUs[tmp_list[0]] = [tmp_list[1]]
-                    # print(active_GPUs)
-
-
-    GPU_to_PID = active_GPUs
-
-    # print(GPU_to_PID)
-    # now we know which GPUs are active with their index
-    
-    for active_gpu_index in active_GPUs:
-        activity_dict[active_gpu_index] = 1
-
-    out_dict = dict()
-
-    for index in tmp_gpus:
-        tmp = tmp_gpus[index]
-        out_dict[tmp] = activity_dict[index]
-
-    return out_dict
-
-
-
-def analyze(data = None):
-    gpu_ids = gpu_uuids()                       # getting list of gpus
-    gpus_activity = gpus_activeness()           # getting activeness of gpus
-
-    analyzed_data = dict()                      # analyzed data
-
-    grouped = data.groupby(["gpu_uuid"])        # grouping the monitored data based on gpu_uuid
-    
-    for uuid in gpu_ids:
-        df1 = grouped.get_group(uuid)
-
-        smact = np.array(df1.loc[:,"smact"].values, dtype=float)
-        gpu_mem = np.array(df1.loc[:,"gpu_memory_usage"].values, dtype=np.float64)
-        gpu_mem_cap = np.array(df1.loc[:,"gpu_memory_cap"].values, dtype=np.float64)
-        
-        smact = np.mean(smact)
-        
-        # smact = smact.reshape(-1, 1)
-        # with warnings.catch_warnings():         # for ignoring warnings when the number of cluster is more than the actual available 
-        #     warnings.simplefilter("ignore")    
-        #     kmeans = KMeans(n_clusters=2, random_state=0, n_init="auto").fit(smact)
-        # # print(max(gpu_mem), smact, kmeans.labels_, kmeans.cluster_centers_, np.mean(smact))
-
-        # # finding the dominant cluster
-        # counter = Counter(kmeans.labels_)
-        # largest_cluster_idx = np.argmax(counter.values())
-        # largest_cluster_center = kmeans.cluster_centers_[largest_cluster_idx]
-
-
-        # analyzed_data[uuid] = [gpus_activity[uuid], last gpu_mem, gpu_mem_cap[0], largest_cluster_center[0]] 
-        analyzed_data[uuid] = [gpus_activity[uuid], gpu_mem[-1], gpu_mem_cap[0], (gpu_mem_cap[0] - gpu_mem[-1]),  smact] 
-    df = pd.DataFrame.from_dict(analyzed_data)
-    df = df.T
-    df.rename(columns={0: 'active', 1: 'GPU_mem_in_use', 2: 'GPU_mem_total', 3: 'GPU_mem_available', 4: 'smact'}, inplace=True)
-    return df
-
-def metrics():
+header_flag_top = True
+def top_system_logger():
     while True:
-        global Gmetrics
-        a = monitor_and_log_minute_scale(log=False, timestamp=1, window=1.5)
+        # time.sleep(3)
+        a = top_extractor()
 
-        # ==== we must have GPU memory updated more frequently ======
-        # gpu_memory = gpu_mem_usage()
-    
-        m = analyze(a)
-        Gmetrics = m
+        global header_flag_top
+        if header_flag_top == True:
+            a.to_csv('top_data.csv', mode='a', index = False)
+            header_flag_top = False
+        else:
+            a.to_csv('top_data.csv', mode='a', header = False, index=False)
 
 
-# print(top_extractor())
+def pid_on_system(pid: str) -> bool:
+    result = execute_command("ps -e")
+    return pid in result
+
+
+
+
+# from threading import Thread
+# Thread(target = monitor_logger).start()
+
+
+# while True:
+#     print(analyze_Gmetrics())
+#     time.sleep(5)

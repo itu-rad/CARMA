@@ -96,7 +96,7 @@ max_duration = 3 * 60
 # ===============================
 
 
-start = time.time()
+start = time.perf_counter()
 # Command-line arguments
 parser = argparse.ArgumentParser(description='Train EfficientNet-B0 on CIFAR-100')
 parser.add_argument('--batch_size', type=int, default=64, help='Batch size for training (default: 64)')
@@ -130,8 +130,14 @@ model = create_model('resnet18', pretrained=False, num_classes=100)
 model = model.to(device)
 
 
-# print(fn(model, int(args.batch_size), (3, 32, 32)))
 
+
+faketensor_time1 = time.perf_counter()
+print(fn(model, int(args.batch_size), (3, 32, 32)))
+faketensor_time2 = time.perf_counter()
+
+faketensor_time = faketensor_time2 - faketensor_time1
+print("Time taken by faketensor: ", faketensor_time)
 # exit()
 
 # Print model summary
@@ -199,6 +205,6 @@ for epoch in range(1, args.epochs + 1):  # Train for specified epochs
     #     torch.save(model.state_dict(), 'efficientnet_b0_cifar10.pth')
     #     best_acc = acc
 
-end = time.time()
+end = time.perf_counter()
 
 print("time: ", end - start)

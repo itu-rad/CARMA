@@ -1,0 +1,12 @@
+# assumption is that model.txt file is in this directory
+conda activate tf
+python /home/ehyo/rad-scheduler/workloads/vision/references/detection/train.py --dataset coco --data-path /raid/datasets/coco --model maskrcnn_resnet50_fpn --epochs 1 -b 8 --output-dir runs
+maskrcnn.model
+coco
+128
+exclusive
+1
+28606
+7902.3
+40000
+8000

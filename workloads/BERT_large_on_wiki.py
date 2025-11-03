@@ -1,8 +1,10 @@
 import torch
 from torch.utils.data import DataLoader
-from transformers import BertTokenizer, BertConfig, BertForMaskedLM, AdamW
+from transformers import BertTokenizer, BertConfig, BertForMaskedLM
 from transformers import DataCollatorForLanguageModeling
 from datasets import load_dataset
+
+from torch.optim import AdamW
 
 from tqdm import tqdm
 
@@ -10,7 +12,7 @@ from modelsummary import summary  # Import modelsummary
 
 import time
 
-start = time.time()
+start = time.perf_counter()
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -120,7 +122,7 @@ for epoch in range(epochs):
 
 # print("Training completed and model saved.")
 
-end = time.time()
+end = time.perf_counter()
 
 
 execution_time = end - start
