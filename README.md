@@ -99,15 +99,41 @@ For reproducibility, we provide a companion repository that analyzes the Philly 
 
 
 
+## How to use
+
+Start the task server:
+
+
+```bash
+python src/server.py
+```
+
+Submit a task described in a .rad file:
+
+```bash
+python src/submit.py --task /directory/of/your/task.rad
+```
+
+
+Example dispatch script used in our evaluation (staggered submissions with sleep):
+
+```bash
+sleep 29
+python /home/username/rad-scheduler/src/submit.py --task /home/username/rad-scheduler/workloads/resnet34_cifar100_20e_3.rad
+sleep 28
+python /home/username/rad-scheduler/src/submit.py --task /home/username/rad-scheduler/workloads/resnet18_cifar100_20e_2.rad
+sleep 151
+python /home/username/rad-scheduler/src/submit.py --task /home/username/rad-scheduler/workloads/BERT_base.rad
+sleep 124
+```
 
 
 ## Further improvements TODOs
 
-1. Making recovery method more flexible
-
-## How to use
-
-
+1. Implement robust recovery by indexing launched tasks (ditch temp dir).
+2. Explore looser recovery options (instead of exclsive, consider another GPU with for example +5GB memory compared to the previous one).
+3. Generalize the command generator for all task types (Non ML/DL).
+4. Thinking about mechanisms for detecting the cases like asking for GPUs but not using them!
 
 ## License & Citation
 
