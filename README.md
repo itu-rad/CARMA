@@ -1,6 +1,6 @@
 # CARMA: Collocation-Aware Resource Manager with GPU Memory Estimator
 
-CARMA is a server‑scale task scheduler/mapper that boosts GPU utilization via safe task‑level collocation guided by a lightweight GPU memory estimator (GPUMemNet) and guarded by utilization/memory preconditions and a crash‑recovery loop.
+CARMA is a server-scale, task-level, collocation-aware resource manager that mitigates GPU underutilization in deep-learning training. By closely monitoring GPU resources and embedding collocation policies into placement, CARMA boosts performance, utilization, and energy efficiency. We argue that collocation-aware, task-informed resource management will be central to future DL infrastructure for higher resource efficiency.
 
 <p align="center">
 <img src="assets/img/CARMA-logo.png" alt="CARMA logo" width="200"/>
@@ -28,61 +28,63 @@ flowchart TD
     style GPUs fill:red,stroke:#333,stroke-width:4px
 ```
 
-## Evaluation Workloads
-
-For evaluating the idea of CARMA, we used a subset of the Philly trace to mimic realistic task-arrival behavior in a real-world system. We built two derived traces, one with [90 tasks](assets/philly-based-evaluation-traces/philly_mix-90-tasks.sh) and another with [60 tasks](assets/philly-based-evaluation-traces/philly_heavy-60-tasks.sh). Because the Philly trace does not specify the actual jobs, we assembled light, medium, and heavy training tasks—including both CNNs and Transformers—guided by recent findings on production cluster loads. In the 90-task trace, we included a full mix of light, medium, and heavy jobs with varied runtimes to reflect a realistic scenario; in the 60-task trace, we focused on medium and heavy jobs. The chosen workloads are:
+## Evaluation setup. 
+We emulate realistic arrivals using a subset of the Philly cluster trace. From it, we constructed two derived traces of 60 tasks each. Because the original trace omits concrete job definitions, we instantiated representative light, medium, and heavy training tasks—covering CNNs, transformer-based models, and other workloads—aligned with recent observations of production cluster mixes.
 
 ### Transformer (WikiText-2) — *heavy*
 
-| Model           | BS | GPUs | ET (m) | Epochs | Mem (GB) |
-|:----------------|---:|----:|------:|------:|---------:|
-| `xlnet_base`    |  8 |   2 |  8.95 |     8 |     9.72 |
-| `BERT_base`     | 32 |   1 | 14.87 |     1 |    20.77 |
-| `xlnet_large`   |  4 |   2 | 25.31 |     3 |    14.55 |
-| `BERT_large`    |  8 |   1 | 44.93 |     1 |    13.57 |
-| `gpt2_large`    |  8 |   2 | 64.96 |     1 |    27.90 |
+| Model         | BS | GPUs | ET (m) | Epochs | Mem (GB) |
+|:--------------|---:|----:|------:|------:|---------:|
+| `xlnet_base`  |  8 |   2 |  7.38 |     8 |     9.20 |
+| `BERT_base`   | 32 |   1 | 14.92 |     1 |    19.83 |
+| `xlnet_large` |  4 |   2 | 19.58 |     3 |    19.33 |
+| `BERT_large`  |  8 |   1 | 44.93 |     1 |    12.63 |
+| `gpt2_large`  |  8 |   2 | 65.72 |     1 |    28.36 |
 
 
-### CNN (ImageNet) — *medium / heavy*
+### Vision models, and a Recommender (ImageNet, VOC, COCO, Criteo) — *medium / heavy*
 
-| Model             | BS | GPUs | ET (m) | Epochs | Mem (GB) |
-|:------------------|---:|----:|------:|------:|---------:|
-| `efficientnet_b0` |  32 |   1 | 36.21 |     1 |     4.96 |
-| `efficientnet_b0` |  64 |   1 | 35.41 |     1 |     7.84 |
-| `efficientnet_b0` | 128 |   1 | 35.21 |     1 |    13.83 |
-| `resnet50`        |  32 |   1 | 36.32 |     1 |     5.26 |
-| `resnet50`        |  64 |   1 | 35.50 |     1 |     8.54 |
-| `resnet50`        | 128 |   1 | 35.01 |     1 |    15.12 |
-| `mobilenet_v2`    |  32 |   1 | 36.09 |     1 |     4.54 |
-| `mobilenet_v2`    |  64 |   1 | 35.43 |     1 |     7.22 |
-| `mobilenet_v2`    | 128 |   1 | 34.91 |     1 |    12.58 |
-| `vgg16`           |  32 |   1 | 48.45 |     1 |     8.22 |
-| `vgg16`           |  64 |   1 | 44.38 |     1 |    13.64 |
-| `vgg16`           | 128 |   1 | 42.42 |     1 |    24.41 |
-| `Xception`        |  32 |   1 | 46.86 |     1 |     7.20 |
-| `Xception`        |  64 |   1 | 45.78 |     1 |    11.52 |
-| `Xception`        | 128 |   1 | 44.44 |     1 |    22.98 |
-| `inception`       |  32 |   1 | 50.10 |     1 |     6.35 |
-| `inception`       |  64 |   1 | 46.29 |     1 |    10.56 |
-| `inception`       | 128 |   1 | 44.85 |     1 |    19.02 |
-
+| Model              | BS | GPUs | ET (m) | Epochs | Mem (GB) |
+|:-------------------|---:|----:|------:|------:|---------:|
+| `efficientnet_b0`  |  32 |   1 | 41.96 |     1 |     3.75 |
+| `efficientnet_b0`  |  64 |   1 | 28.48 |     1 |     6.70 |
+| `efficientnet_b0`  | 128 |   1 | 27.52 |     1 |    12.67 |
+| `resnet50`         |  32 |   1 | 34.96 |     1 |     3.94 |
+| `resnet50`         |  64 |   1 | 32.58 |     1 |     7.11 |
+| `resnet50`         | 128 |   1 | 31.27 |     1 |    13.24 |
+| `mobilenet_v2`     |  32 |   1 | 29.47 |     1 |     3.36 |
+| `mobilenet_v2`     |  64 |   1 | 25.70 |     1 |     6.04 |
+| `mobilenet_v2`     | 128 |   1 | 25.44 |     1 |    11.34 |
+| `vgg16`            |  32 |   1 | 50.77 |     1 |     6.69 |
+| `vgg16`            |  64 |   1 | 46.70 |     1 |    11.77 |
+| `vgg16`            | 128 |   1 | 44.60 |     1 |    21.87 |
+| `Xception`         |  32 |   1 | 49.86 |     1 |     5.92 |
+| `Xception`         |  64 |   1 | 48.82 |     1 |    11.20 |
+| `Xception`         | 128 |   1 | 47.57 |     1 |    21.24 |
+| `inception`        |  32 |   1 | 58.75 |     1 |     5.23 |
+| `inception`        |  64 |   1 | 51.27 |     1 |     9.34 |
+| `inception`        | 128 |   1 | 49.80 |     1 |    17.84 |
+| `UNet`             |   8 |   1 |  0.35 |    90 |     9.91 |
+| `MaskRCNN`         |   8 |   1 | 112.07 |     1 |    28.61 |
+| `DLRM`             |   8 |   1 | 25.24 |   <1 |     1.47 |
 
 ### CNN (CIFAR-100) — *light*
 
+
 | Model             | BS | GPUs | ET (m) | Epochs | Mem (GB) |
 |:------------------|---:|----:|------:|:------:|---------:|
-| `efficientnet_b0` |  32 |   1 | 0.77 | 20,50 |     1.86 |
-| `efficientnet_b0` |  64 |   1 | 0.48 | 20,50 |     1.91 |
-| `efficientnet_b0` | 128 |   1 | 0.27 | 20,50 |     2.05 |
-| `resnet18`        |  32 |   1 | 0.33 | 20,50 |     1.96 |
-| `resnet18`        |  64 |   1 | 0.22 | 20,50 |     1.97 |
-| `resnet18`        | 128 |   1 | 0.16 | 20,50 |     2.01 |
-| `resnet34`        |  32 |   1 | 0.49 | 20,50 |     2.15 |
-| `resnet34`        |  64 |   1 | 0.30 | 20,50 |     2.17 |
-| `resnet34`        | 128 |   1 | 0.20 | 20,50 |     2.19 |
-| `S_mobilenetv3`   |  32 |   1 | 0.54 | 20,50 |     1.78 |
-| `S_mobilenetv3`   |  64 |   1 | 0.32 | 20,50 |     1.79 |
-| `S_mobilenetv3`   | 128 |   1 | 0.22 | 20,50 |     1.82 |
+| `efficientnet_b0` |  32 |   1 | 1.06 | 20,50 |     0.67 |
+| `efficientnet_b0` |  64 |   1 | 1.09 | 20,50 |     0.72 |
+| `efficientnet_b0` | 128 |   1 | 1.14 | 20,50 |     8.67 |
+| `resnet18`        |  32 |   1 | 0.49 | 20,50 |     0.79 |
+| `resnet18`        |  64 |   1 | 0.23 | 20,50 |     0.80 |
+| `resnet18`        | 128 |   1 | 0.17 | 20,50 |     0.86 |
+| `resnet34`        |  32 |   1 | 0.83 | 20,50 |     1.01 |
+| `resnet34`        |  64 |   1 | 0.44 | 20,50 |     1.02 |
+| `resnet34`        | 128 |   1 | 0.22 | 20,50 |     2.08 |
+| `S_mobilenetv3`   |  32 |   1 | 0.95 | 20,50 |     0.59 |
+| `S_mobilenetv3`   |  64 |   1 | 0.50 | 20,50 |     0.60 |
+| `S_mobilenetv3`   | 128 |   1 | 0.31 | 20,50 |     0.64 |
 
 
 ### Related tool: Philly Trace Analyzer & Task Mapper
@@ -101,11 +103,11 @@ For reproducibility, we provide a companion repository that analyzes the Philly 
 
 ## Further improvements TODOs
 
-1. Making atomic time slots [yet their size to be configurable | e.g., 12h] for each mapped for execution. It brings fairness into the system and avoid head-of-line blocking.
+1. Making recovery method more flexible
 
-2. Making recovery method more flexible
+## How to use
 
-3. Keeping track of mapped tasks in an efficient data structure to not only rely on monitoring GPUs (It can facilitate decision making process in cases of exclusive assignment, and make recovery method more efficient in terms of checking less error files instead of all of the files in a directory)
+
 
 ## License & Citation
 
